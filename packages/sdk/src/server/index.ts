@@ -90,7 +90,7 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
   if (family === "sessions" && rest.length === 1 && rest[0] === "refresh" && method === "POST") {
     return handleAuthSession(ctx, request, url, "refresh");
   }
-  if (family === "storage") return handleStorage(ctx, request, url, rest, family);
+  if (family === "storage") return handleStorage(ctx, request, url, rest, parts[0]!);
   if (family === "queries" && rest.length === 1 && rest[0] !== undefined && method === "GET") {
     return handleQuery(ctx, request, url, pathSegment(rest[0]));
   }

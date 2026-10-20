@@ -1,7 +1,7 @@
 import { ProtocolError } from "../protocol/errors.js";
 import { claimedSteamId, resolvePlayer, type PlayerIdentity } from "../protocol/identity.js";
 import { applyWriteOps, OperationError } from "../dsl/operations.js";
-import type { CollectionDefinition, RecordData } from "../storage/types.js";
+import type { CollectionDefinition, EndpointStorage, ExpectedVersion, RecordData, VersionedRecord } from "../storage/types.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
@@ -73,6 +73,8 @@ async function guardAccess(
   if (op === "delete" && definition.allowRecordDelete !== true) {
     throw new ProtocolError(403, "RECORD_DELETE_DISABLED", "Record deletion is not enabled for this collection.");
   }
+  // Auth-disabled projects keep the unverified client identity and skip the ownership gate.
+  if (ctx.options.requireSboxAuth !== true) return;
   if (op === "read" || definition.collectionType === "global") return;
   const steamId = await playerOf(ctx, request, url, body);
   if (key !== steamId && !key.startsWith(`${steamId}_`)) {
@@ -101,6 +103,12 @@ function recordNotFound(): Response {
 function asDocument(body: unknown): RecordData {
   if (!isRecord(body)) throw new ProtocolError(400, "INVALID_BODY", "Body must be a JSON object.");
   return body;
+}
+
+// The planner rejects a put to any record the run has not observed. Routes read the target's version first and
+// commit against it, so a concurrent change fails with CONFLICT instead of being overwritten.
+function expecting(collection: string, key: string, observed: VersionedRecord): ExpectedVersion[] {
+  return [{ collection, key, version: observed.version }];
 }
 
 function applyOps(existing: RecordData | null, ops: readonly unknown[]): RecordData {
@@ -142,8 +150,9 @@ async function writeDocument(
   await guardAccess(ctx, request, url, definition, "write", key, access, document);
   const storage = ctx.storage();
   const ops = document["ops"];
-  const data = Array.isArray(ops) ? applyOps(await storage.records.get(collectionId, key), ops) : document;
-  await storage.apply([{ op: "put", collection: collectionId, key, data }]);
+  const observed = await storage.records.getVersioned(collectionId, key);
+  const data = Array.isArray(ops) ? applyOps(observed.data, ops) : document;
+  await storage.apply([{ op: "put", collection: collectionId, key, data }], { expectedVersions: expecting(collectionId, key, observed) });
   return jsonResponse({ ok: true });
 }
 
@@ -209,7 +218,9 @@ async function appendRecord(
   const writer = await playerOf(ctx, request, url, body);
   const id = newId();
   const record = { ...body, _id: id, _timestamp: ctx.now(), _writerId: writer };
-  await ctx.storage().apply([{ op: "put", collection: collectionId, key: id, data: record }]);
+  const storage = ctx.storage();
+  const observed = await storage.records.getVersioned(collectionId, id);
+  await storage.apply([{ op: "put", collection: collectionId, key: id, data: record }], { expectedVersions: expecting(collectionId, id, observed) });
   const response = { ok: true, record };
   if (replayKey !== null) replays.set(replayKey, response);
   return jsonResponse(response);
@@ -265,9 +276,11 @@ async function createSave(
   const id = newId();
   const key = `${steamId}_${id}`;
   await guardAccess(ctx, request, url, definition, "write", key, access, body);
-  await ctx.storage().apply([
-    { op: "put", collection: collectionId, key, data: { recordName: name, data: payload ?? {} } },
-  ]);
+  const storage = ctx.storage();
+  const observed = await storage.records.getVersioned(collectionId, key);
+  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload ?? {} } }], {
+    expectedVersions: expecting(collectionId, key, observed),
+  });
   return jsonResponse({ ok: true, recordId: id, recordName: name });
 }
 
@@ -285,11 +298,14 @@ async function updateSave(
   const body = await readJsonBody(request);
   await guardAccess(ctx, request, url, definition, "write", key, access, body);
   const storage = ctx.storage();
-  const existing = await storage.records.get(collectionId, key);
+  const observed = await storage.records.getVersioned(collectionId, key);
+  const existing = observed.data;
   if (existing === null) return recordNotFound();
   const name = typeof body["recordName"] === "string" ? body["recordName"] : existing["recordName"];
   const payload = isRecord(body["data"]) ? body["data"] : existing["data"];
-  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload } }]);
+  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload } }], {
+    expectedVersions: expecting(collectionId, key, observed),
+  });
   return jsonResponse({ ok: true, recordId: id, recordName: name });
 }
 
@@ -328,11 +344,14 @@ async function heartbeat(ctx: ServerContext, request: Request, url: URL): Promis
   const sessionId = typeof body["sessionId"] === "string" ? body["sessionId"] : "default";
   const sessionSeconds = typeof body["sessionSeconds"] === "number" && body["sessionSeconds"] >= 0 ? body["sessionSeconds"] : 0;
   const storage = ctx.storage();
-  const existing = await storage.records.get("_stats", steamId);
+  const observed = await storage.records.getVersioned("_stats", steamId);
+  const existing = observed.data;
   const sessions = { ...numbersOf(existing?.["sessions"]), [sessionId]: sessionSeconds };
   const totalSeconds = Object.values(sessions).reduce((sum, seconds) => sum + seconds, 0);
   const lastHeartbeat = new Date(ctx.now()).toISOString();
-  await storage.apply([{ op: "put", collection: "_stats", key: steamId, data: { sessions, totalSeconds, lastHeartbeat } }]);
+  await storage.apply([{ op: "put", collection: "_stats", key: steamId, data: { sessions, totalSeconds, lastHeartbeat } }], {
+    expectedVersions: expecting("_stats", steamId, observed),
+  });
   return jsonResponse({
     ok: true,
     persisted: true,
@@ -373,7 +392,9 @@ async function recordEvent(ctx: ServerContext, request: Request, url: URL): Prom
     playerName: body["playerName"] ?? null,
     createdAt: new Date(ctx.now()).toISOString(),
   };
-  await ctx.storage().apply([{ op: "put", collection: "_analytics", key, data: event }]);
+  const storage = ctx.storage();
+  const observed = await storage.records.getVersioned("_analytics", key);
+  await storage.apply([{ op: "put", collection: "_analytics", key, data: event }], { expectedVersions: expecting("_analytics", key, observed) });
   return jsonResponse({ ok: true, stored: true, reason: null });
 }
 
@@ -425,6 +446,7 @@ export async function handleStorage(
     family !== "api" &&
     declared(ctx, collectionId)?.collectionType === "global"
   ) {
+    await guardAccess(ctx, request, url, requireDeclared(ctx, collectionId), "read", "", access, null);
     return listRecords(ctx, collectionId);
   }
   if (
@@ -434,6 +456,7 @@ export async function handleStorage(
     method === "GET" &&
     declared(ctx, collectionId)?.collectionType === "global"
   ) {
+    await guardAccess(ctx, request, url, requireDeclared(ctx, collectionId), "read", "", access, null);
     return readRecord(ctx, collectionId, pathSegment(third));
   }
   if (rest.length === 3 && third === "probe" && second !== undefined && method === "GET") {

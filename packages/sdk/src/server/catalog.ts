@@ -268,8 +268,8 @@ export function documentOf(catalog: Catalog, kind: ResourceKind, id: string): Re
 const INTERNAL_COLLECTIONS: readonly CollectionDefinition[] = [
   // Per-player heartbeat totals written by the stats route.
   { id: "_stats", collectionType: "per-steamid", accessMode: "endpoint", schema: { type: "object" } },
-  // Analytics events written by the analytics route.
-  { id: "_analytics", collectionType: "per-steamid", accessMode: "endpoint", schema: { type: "object" } },
+  // Analytics events, one record per event. Global so the per-player maxRecords limit does not apply.
+  { id: "_analytics", collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
 ];
 
 export function storageDefinitionOf(catalog: Catalog, values: ValuesDocument): StorageDefinition {

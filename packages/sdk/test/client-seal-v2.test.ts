@@ -10,10 +10,22 @@ import { openV2Response, sealV2Request } from "../src/protocol/envelope-v2-clien
 
 const fixturePath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "test", "fixtures", "network-storage", "encrypted-request-v2-vectors.json");
 
+interface FixtureEnvelope {
+  projectId: string;
+  endpointSlug: string;
+  steamId: string;
+  keyId: string;
+  nonce: string;
+  iv: string;
+  tag: string;
+  encryptedPayload: string;
+  [field: string]: string;
+}
+
 interface FixtureRequest {
   name: string;
   aesKey: string;
-  envelope: Record<string, string>;
+  envelope: FixtureEnvelope;
 }
 
 interface FixtureFile {

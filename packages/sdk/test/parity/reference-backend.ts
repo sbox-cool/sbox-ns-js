@@ -1,11 +1,18 @@
 import { createServer, type Server } from "node:http";
 import { generateKeyPairSync } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { createRequire } from "node:module";
 import { parse as parseYaml } from "yaml";
 import { nodeHandler } from "../../src/adapters/node.js";
-import { createSqliteStorage } from "../../src/storage/sqlite.js";
+import { createSqliteStorage, type SqliteDatabase } from "../../src/storage/index.js";
 import { createMemoryReplayStore } from "../../src/protocol/replay.js";
 import { createNetworkStorageServer, type ServerOptions } from "../../src/server/index.js";
+
+// node:sqlite is loaded with createRequire and a typed shape: the installed @types/node does not declare it.
+interface NodeSqlite {
+  DatabaseSync: new (path: string) => SqliteDatabase;
+}
+
+const { DatabaseSync }: NodeSqlite = createRequire(import.meta.url)("node:sqlite");
 
 // The project the parity corpus runs against. The corpus templates these values, so any fixed set works.
 export const PARITY_PROJECT = {
@@ -29,8 +36,7 @@ export function referenceOptions(): ServerOptions {
     signingPrivateKeyPem,
     sessionSecret: null,
     endpoints: {},
-    storage: (definition) =>
-      createSqliteStorage({ db, collections: definition.collections, values: definition.values as Record<string, unknown> }),
+    storage: (definition) => createSqliteStorage({ db, collections: definition.collections, values: definition.values }),
     parseYaml,
     fetchPolicy: { allowedHosts: [], resolveHost: async () => [] },
     replayStore: createMemoryReplayStore(),
@@ -40,7 +46,12 @@ export function referenceOptions(): ServerOptions {
 // Starts the reference backend on a local port and resolves once it is listening.
 export function startReferenceBackend(port: number, host = "127.0.0.1"): Promise<Server> {
   const server = createServer(nodeHandler(createNetworkStorageServer(referenceOptions())));
-  const { promise, resolve, reject } = Promise.withResolvers<Server>();
+  let resolve!: (server: Server) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<Server>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
   server.once("error", reject);
   server.listen(port, host, () => resolve(server));
   return promise;
