@@ -3,10 +3,10 @@ import type { FetchResponseData } from "./fetch.js";
 
 export type { RecordData };
 
-// Handlers must `await` records, values, workflows and secrets: the engine returns synchronously, this
-// backend does not. `await` on a plain value is a no-op, so one handler runs on both.
-export type MaybePromise<T> = T | Promise<T>;
-
+// Handlers are synchronous, exactly as server script endpoints are. `ns` reads from the run's state snapshot.
+// A read of state that is not loaded yet returns null for this pass; the engine loads the missing state and
+// runs the handler again, so the handler always observes a complete, consistent snapshot before its writes
+// are committed. Handlers never await anything.
 export interface EndpointRequest {
   // Query parameters for GET, the JSON object body for POST. Reserved auth keys are removed.
   input: Record<string, unknown>;
@@ -17,27 +17,27 @@ export interface EndpointRequest {
 }
 
 export interface NsRecords {
-  get(collection: string, key: string): MaybePromise<RecordData | null>;
-  put(collection: string, key: string, data: RecordData): MaybePromise<void>;
-  delete(collection: string, key: string): MaybePromise<void>;
-  list(collection: string): MaybePromise<RecordData[]>;
+  get(collection: string, key: string): RecordData | null;
+  put(collection: string, key: string, data: RecordData): void;
+  delete(collection: string, key: string): void;
+  list(collection: string): RecordData[];
 }
 
 export interface NsValues {
   // "group" or "group.key". Resolves to null when absent.
-  get(path: string): MaybePromise<unknown>;
+  get(path: string): unknown;
 }
 
 export interface NsWorkflows {
   // Runs a workflow registered with the project. Record writes made by the workflow are rolled back
   // if it throws; the error then propagates to the caller.
-  run(workflowId: string, input?: Record<string, unknown>): MaybePromise<unknown>;
+  run(workflowId: string, input?: Record<string, unknown>): unknown;
 }
 
 export interface NsSecrets {
-  // Resolves to null when the secret is not set. Throws SECRET_UNAVAILABLE when it exists but cannot be
-  // read, for example because the secret store is unreachable.
-  get(name: string): MaybePromise<string | null>;
+  // Returns null when the secret is not set. Fails the run with SECRET_UNAVAILABLE when the secret store
+  // cannot be reached.
+  get(name: string): string | null;
 }
 
 export type FetchMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -74,6 +74,7 @@ export type WorkflowFunction = (input: Record<string, unknown>, ns: Ns) => unkno
 
 export type EndpointHandler = (req: EndpointRequest, ns: Ns, scope: EndpointScope) => unknown;
 
+// A script endpoint as the server runs it. `handle` is synchronous; see the note above EndpointRequest.
 export interface EndpointDefinition {
   handle: EndpointHandler;
 }

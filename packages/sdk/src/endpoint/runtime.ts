@@ -1,4 +1,4 @@
-import type { EndpointStorage, ExpectedVersion, RecordData, RecordWrite } from "../storage/index.js";
+import type { EndpointStorage, ExpectedVersion, RecordData, RecordWrite, StoredRecord, VersionedRecord } from "../storage/index.js";
 import { isRecord } from "../util/guards.js";
 import {
   FETCH_LIMITS,
@@ -10,15 +10,7 @@ import {
   refuseHost,
   sendFetch,
 } from "./fetch.js";
-import type {
-  EndpointDefinition,
-  EndpointGlobal,
-  EndpointRequest,
-  FetchOptions,
-  FetchResponse,
-  Ns,
-  WorkflowFunction,
-} from "./types.js";
+import type { EndpointDefinition, EndpointGlobal, EndpointRequest, FetchOptions, FetchResponse, Ns, WorkflowFunction } from "./types.js";
 
 // Thrown by ns.fail(). The backend maps it to a status and an error body.
 export class ScriptFailure extends Error {
@@ -65,14 +57,14 @@ export interface RunOutcome {
   expectedVersions: ExpectedVersion[];
 }
 
-// Runs an endpoint handler to completion. The handler may run several times:
-//   - ns.fetch returns null on the first pass for each new request. Those requests are sent after
-//     the pass, and the handler runs again with their results.
-//   - A pass that throws while requests are pending is discarded, because it probably threw on the
-//     null response. The next pass decides the outcome.
-// Every pass that issues a new request adds at least one completed outcome, and new requests stop at
-// FETCH_LIMITS.maxRequestsPerExecution, so the number of passes is bounded by that limit plus one.
-// Writes are staged per pass and committed only when a pass completes without pending requests.
+// Upper bound on rounds that load missing state. Each round loads at least one value the handler reads for the first
+// time, so the bound is the depth of dependent reads, not the number of keys read.
+const STATE_LOAD_ROUNDS = 32;
+
+// Handlers read state synchronously, as server scripts do. A read the run has not loaded yet returns null and records
+// a need. A pass that recorded a need is discarded; the needs are loaded from storage and the handler runs again.
+// Outbound requests work the same way: a pass that started one is discarded and the request is sent before the rerun.
+// Writes are staged per pass and committed only when a pass completes with no needs and no pending requests.
 // Logs from discarded passes are dropped.
 export async function runEndpoint(
   definition: EndpointDefinition,
@@ -80,21 +72,39 @@ export async function runEndpoint(
   env: RunEnvironment,
 ): Promise<RunOutcome> {
   const completed = new Map<string, FetchOutcome>();
+  const state: RunState = { records: new Map(), lists: new Map(), values: new Map(), secrets: new Map() };
+  let stateRounds = 0;
   for (;;) {
     throwIfCancelled(env.signal);
-    const pass = new Pass(env, completed);
+    const pass = new Pass(env, state, completed);
     let value: unknown;
     let failure: { error: unknown } | null = null;
     try {
-      value = await definition.handle(request, pass.ns, { globals: env.globals });
+      value = definition.handle(request, pass.ns, { globals: env.globals });
+      if (isThenable(value)) {
+        // The rejection is observed here, so it cannot surface as an unhandled promise rejection.
+        Promise.resolve(value).catch(() => undefined);
+        throw new TypeError("Endpoint handlers must be synchronous; ns reads and writes are synchronous.");
+      }
     } catch (error) {
       failure = { error };
     }
     throwIfCancelled(env.signal);
-    if (pass.pending.size === 0) {
+    if (pass.needs.size === 0 && pass.pending.size === 0) {
       if (failure !== null) throw failure.error;
       for (const entry of pass.logs) env.log(entry);
       return { value, writes: pass.writes.stagedWrites(), expectedVersions: pass.writes.expectedVersions() };
+    }
+    if (pass.needs.size > 0) {
+      stateRounds += 1;
+      if (stateRounds > STATE_LOAD_ROUNDS) {
+        throw new ScriptFailure(
+          "STATE_LOAD_LIMIT_EXCEEDED",
+          `The endpoint run read dependent state more than ${STATE_LOAD_ROUNDS} times.`,
+          500,
+        );
+      }
+      await Promise.all([...pass.needs.values()].map((load) => load()));
     }
     const sent = await Promise.all(
       [...pass.pending.entries()].map(
@@ -109,19 +119,34 @@ function throwIfCancelled(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new RunCancelled();
 }
 
+function isThenable(value: unknown): boolean {
+  return typeof value === "object" && value !== null && "then" in value && typeof value.then === "function";
+}
+
+// State loaded from storage for one run. Shared across passes so every pass sees the same snapshot.
+interface RunState {
+  records: Map<string, VersionedRecord>;
+  lists: Map<string, StoredRecord[]>;
+  values: Map<string, unknown>;
+  secrets: Map<string, string | null>;
+}
+
 // State for one pass of the handler.
 class Pass {
   readonly pending = new Map<string, ParsedFetch>();
+  readonly needs = new Map<string, () => Promise<void>>();
   readonly logs: unknown[] = [];
   readonly writes: RecordOverlay;
   readonly ns: Ns;
   private readonly env: RunEnvironment;
+  private readonly state: RunState;
   private readonly completed: Map<string, FetchOutcome>;
 
-  constructor(env: RunEnvironment, completed: Map<string, FetchOutcome>) {
+  constructor(env: RunEnvironment, state: RunState, completed: Map<string, FetchOutcome>) {
     this.env = env;
+    this.state = state;
     this.completed = completed;
-    this.writes = new RecordOverlay(env.storage.records);
+    this.writes = new RecordOverlay(env, state, this.needs);
     this.ns = this.buildNs();
   }
 
@@ -134,7 +159,7 @@ class Pass {
         list: (collection) => this.writes.list(collection),
       },
       values: {
-        get: (path) => this.env.storage.values.get(path),
+        get: (path) => this.readValue(path),
       },
       workflows: {
         run: (workflowId, input) => this.runWorkflow(workflowId, input),
@@ -155,7 +180,7 @@ class Pass {
 
   // Workflow writes are rolled back when the workflow throws, so a failed workflow never leaves partial
   // state in this pass. Outbound requests already issued stay pending and are sent with the pass.
-  private async runWorkflow(workflowId: string, input: unknown): Promise<unknown> {
+  private runWorkflow(workflowId: string, input: unknown): unknown {
     const workflow = typeof workflowId === "string" && Object.hasOwn(this.env.workflows, workflowId) ? this.env.workflows[workflowId] : undefined;
     if (workflow === undefined) {
       throw new ScriptFailure("WORKFLOW_NOT_FOUND", `ns.workflows.run: no workflow "${String(workflowId)}".`, 500);
@@ -165,22 +190,40 @@ class Pass {
     }
     const snapshot = this.writes.snapshot();
     try {
-      return await workflow(input ?? {}, this.ns);
+      const result = workflow(input ?? {}, this.ns);
+      if (isThenable(result)) {
+        Promise.resolve(result).catch(() => undefined);
+        throw new TypeError("ns.workflows.run: workflows must be synchronous.");
+      }
+      return result;
     } catch (error) {
       this.writes.restore(snapshot);
       throw error;
     }
   }
 
-  private async readSecret(name: string): Promise<string | null> {
+  private readValue(path: string): unknown {
+    if (typeof path !== "string") throw new TypeError("ns.values.get: path must be a string.");
+    if (this.state.values.has(path)) return this.state.values.get(path) ?? null;
+    this.needs.set(JSON.stringify(["value", path]), async () => {
+      this.state.values.set(path, await this.env.storage.values.get(path));
+    });
+    return null;
+  }
+
+  private readSecret(name: string): string | null {
     if (typeof name !== "string" || name.length === 0) {
       throw new TypeError("ns.secrets.get: name must be a non-empty string.");
     }
-    try {
-      return await this.env.secrets.get(name);
-    } catch {
-      throw new ScriptFailure("SECRET_UNAVAILABLE", `ns.secrets.get: "${name}" is unavailable.`, 500);
-    }
+    if (this.state.secrets.has(name)) return this.state.secrets.get(name) ?? null;
+    this.needs.set(JSON.stringify(["secret", name]), async () => {
+      try {
+        this.state.secrets.set(name, await this.env.secrets.get(name));
+      } catch {
+        throw new ScriptFailure("SECRET_UNAVAILABLE", `ns.secrets.get: "${name}" is unavailable.`, 500);
+      }
+    });
+    return null;
   }
 
   private fetch(url: string, options: FetchOptions | undefined): FetchResponse | null {
@@ -206,49 +249,67 @@ function deliver(outcome: FetchOutcome): FetchResponse {
   throw new FetchError(failure?.code ?? "FETCH_FAILED", failure?.message ?? "ns.fetch: the request failed.");
 }
 
-// Reads fall through to storage. Writes and deletes are held until the run commits.
+// Reads fall through to the run's loaded state. Writes and deletes are held until the run commits.
 class RecordOverlay {
-  private readonly store: EndpointStorage["records"];
+  private readonly env: RunEnvironment;
+  private readonly state: RunState;
+  private readonly needs: Map<string, () => Promise<void>>;
   private staged = new Map<string, RecordWrite>();
   private readonly versions = new Map<string, ExpectedVersion>();
 
-  constructor(store: EndpointStorage["records"]) {
-    this.store = store;
+  constructor(env: RunEnvironment, state: RunState, needs: Map<string, () => Promise<void>>) {
+    this.env = env;
+    this.state = state;
+    this.needs = needs;
   }
 
-  async get(collection: string, key: string): Promise<RecordData | null> {
+  get(collection: string, key: string): RecordData | null {
     requireName(collection, key);
-    const write = this.staged.get(stagedKey(collection, key));
+    const id = stagedKey(collection, key);
+    const write = this.staged.get(id);
     if (write !== undefined) return write.op === "put" ? copy(write.data) : null;
-    const stored = await this.store.getVersioned(collection, key);
-    this.observe(collection, key, stored.version);
-    return stored.data === null ? null : copy(stored.data);
+    const loaded = this.state.records.get(id);
+    if (loaded === undefined) {
+      this.needs.set(JSON.stringify(["record", collection, key]), async () => {
+        this.state.records.set(id, await this.env.storage.records.getVersioned(collection, key));
+      });
+      return null;
+    }
+    this.observe(collection, key, loaded.version);
+    return loaded.data === null ? null : copy(loaded.data);
   }
 
-  async put(collection: string, key: string, data: unknown): Promise<void> {
+  put(collection: string, key: string, data: unknown): void {
     requireName(collection, key);
     if (!isRecord(data)) throw new TypeError("ns.records.put: data must be an object.");
     this.staged.set(stagedKey(collection, key), { op: "put", collection, key, data: copy(data) });
   }
 
-  async delete(collection: string, key: string): Promise<void> {
+  delete(collection: string, key: string): void {
     requireName(collection, key);
     this.staged.set(stagedKey(collection, key), { op: "delete", collection, key });
   }
 
-  async list(collection: string): Promise<RecordData[]> {
+  list(collection: string): RecordData[] {
     requireName(collection, undefined);
-    const rows = new Map<string, RecordData>();
-    for (const row of await this.store.list(collection)) {
+    const rows = this.state.lists.get(collection);
+    if (rows === undefined) {
+      this.needs.set(JSON.stringify(["list", collection]), async () => {
+        this.state.lists.set(collection, await this.env.storage.records.list(collection));
+      });
+      return [];
+    }
+    const merged = new Map<string, RecordData>();
+    for (const row of rows) {
       this.observe(collection, row.key, row.version);
-      rows.set(row.key, row.data);
+      merged.set(row.key, row.data);
     }
     for (const write of this.staged.values()) {
       if (write.collection !== collection) continue;
-      if (write.op === "put") rows.set(write.key, write.data);
-      else rows.delete(write.key);
+      if (write.op === "put") merged.set(write.key, write.data);
+      else merged.delete(write.key);
     }
-    return [...rows.values()].map((data) => copy(data));
+    return [...merged.values()].map((data) => copy(data));
   }
 
   // The first read of a key fixes the version the run depends on. Later reads see the same version.
