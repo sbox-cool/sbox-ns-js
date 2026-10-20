@@ -8,6 +8,7 @@ import { identityOptionsFor, type ServerContext } from "./context.js";
 import { authorize } from "./endpoints.js";
 import { credentialsOf, pathSegment, readJsonBody, readJsonValue } from "./http.js";
 import { handleQuery } from "./query-routes.js";
+import { LEDGER_COLLECTION, ledgerSummaryOf } from "../endpoint/ledger.js";
 
 // Direct record access (/storage/{project}/{collection}/{key}) and the runtime families built on the same storage.
 // Secret-key callers bypass the document rules. Everything else is checked here, before storage is touched.
@@ -134,6 +135,36 @@ async function readDocument(
   const record = await ctx.storage().records.get(collectionId, key);
   if (record === null) return keyNotFound();
   return jsonResponse(record);
+}
+
+// The ledger rows for one player's _ledger fields, oldest first. A key with no record and no ledger rows is missing.
+// The SDK has no separate player profile, so the record alone marks a player known.
+async function readLedger(
+  ctx: ServerContext,
+  request: Request,
+  url: URL,
+  collectionId: string,
+  steamId: string,
+  access: Access,
+): Promise<Response> {
+  const definition = declared(ctx, collectionId);
+  if (definition === undefined) return keyNotFound();
+  await guardAccess(ctx, request, url, definition, "read", steamId, access, null);
+  const storage = ctx.storage();
+  const entries = (await storage.records.list(LEDGER_COLLECTION))
+    .map((row) => row.data)
+    .filter((row) => row["collection_id"] === collectionId && row["steam_id"] === steamId)
+    .sort((a, b) => String(a["ts"]).localeCompare(String(b["ts"])));
+  if (entries.length === 0 && (await storage.records.get(collectionId, steamId)) === null) return keyNotFound();
+  return jsonResponse({
+    steamId,
+    field: "all",
+    from: null,
+    to: null,
+    entries,
+    summary: ledgerSummaryOf(entries),
+    cursor: null,
+  });
 }
 
 async function writeDocument(
@@ -474,6 +505,11 @@ export async function handleStorage(
   }
   if (rest.length === 4 && rest[2] === "records" && second !== undefined && saveId !== undefined && method === "DELETE") {
     return deleteSave(ctx, request, url, collectionId, pathSegment(second), pathSegment(saveId), access);
+  }
+  if (rest.length === 3 && third === "ledger" && second !== undefined && method === "GET") {
+    const steamId = pathSegment(second);
+    if (steamId.includes("/") || steamId.includes("\\") || steamId === "." || steamId === "..") return keyNotFound();
+    return readLedger(ctx, request, url, collectionId, steamId, access);
   }
   if (rest.length === 2 && second !== undefined) {
     const key = pathSegment(second);

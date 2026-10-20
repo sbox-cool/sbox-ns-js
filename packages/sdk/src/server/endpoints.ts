@@ -1,5 +1,6 @@
 import { DslResponse } from "../dsl/steps.js";
 import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
+import { trackedFieldsOf } from "./catalog.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { openV1Envelope } from "../protocol/envelope-v1.js";
 import { openV2Envelope, sealV2Response, type V2ResponseKey } from "../protocol/envelope-v2.js";
@@ -16,6 +17,7 @@ import { identityOptionsFor, type ServerContext } from "./context.js";
 import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
 import type { EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
+import type { ExecutionMode } from "../endpoint/execution.js";
 
 // Keys that address the call rather than carry input. They never reach the handler.
 const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
@@ -24,13 +26,20 @@ const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
 const NO_SECRETS: SecretStore = { get: () => null };
 
 // Static endpoints from ServerOptions first, then the endpoints the editor pushed (compiled from DSL documents).
-function resolveEndpoint(ctx: ServerContext, slug: string): { handler: EndpointHandler; requiresSecretKey: boolean } | null {
+function resolveEndpoint(
+  ctx: ServerContext,
+  slug: string,
+): { handler: EndpointHandler; requiresSecretKey: boolean; execution: ExecutionMode } | null {
   if (Object.hasOwn(ctx.options.endpoints, slug)) {
-    return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false };
+    return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false, execution: "scripted" };
   }
   const entry = ctx.catalog.endpoints.get(slug);
   if (entry === undefined || !entry.enabled) return null;
-  return { handler: entry.compiled.handler, requiresSecretKey: entry.compiled.requiresSecretKey };
+  return {
+    handler: entry.compiled.handler,
+    requiresSecretKey: entry.compiled.requiresSecretKey,
+    execution: "declarative",
+  };
 }
 
 // Static workflows from ServerOptions, overridden by the workflows the editor pushed.
@@ -215,11 +224,13 @@ async function runCall(
     },
     {
       storage: ctx.storage(),
+      execution: target.execution,
       fetchPolicy: options.fetchPolicy,
       workflows: workflowsOf(ctx),
       globals: options.globals ?? {},
       secrets: options.secrets ?? NO_SECRETS,
       now: ctx.now,
+      trackedFields: (collection) => trackedFieldsOf(ctx.catalog, collection),
       log: options.log ?? (() => undefined),
       signal: request.signal,
     },

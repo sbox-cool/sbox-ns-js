@@ -7,6 +7,7 @@ import {
   type CompiledWorkflow,
 } from "../dsl/compile.js";
 import { isRecord } from "../util/guards.js";
+import { LEDGER_COLLECTION } from "../endpoint/ledger.js";
 import type { StorageDefinition, ValuesDocument } from "./options.js";
 import type { CollectionDefinition } from "../storage/types.js";
 import type { QueryDefinition } from "./query-routes.js";
@@ -32,17 +33,20 @@ const MANAGEMENT_KEYS = new Set([
 
 export interface EndpointEntry {
   readonly document: Readonly<Record<string, unknown>>;
+  readonly record: Readonly<Record<string, unknown>>;
   readonly compiled: CompiledEndpoint;
   readonly enabled: boolean;
 }
 
 export interface CollectionEntry {
   readonly document: Readonly<Record<string, unknown>>;
+  readonly record: Readonly<Record<string, unknown>>;
   readonly compiled: CompiledCollection;
 }
 
 export interface WorkflowEntry {
   readonly document: Readonly<Record<string, unknown>>;
+  readonly record: Readonly<Record<string, unknown>>;
   readonly compiled: CompiledWorkflow;
 }
 
@@ -192,14 +196,14 @@ function compileOne(kind: ResourceKind, record: unknown, parse: Parser): Compile
   const document = documentFor(kind, record, parse);
   if (kind === "endpoints") {
     const compiled = compileEndpoint(document);
-    return { kind, id: compiled.id, entry: { document, compiled, enabled: record["enabled"] !== false } };
+    return { kind, id: compiled.id, entry: { document, record, compiled, enabled: record["enabled"] !== false } };
   }
   if (kind === "collections") {
     const compiled = compileCollection(document);
-    return { kind, id: compiled.definition.id, entry: { document, compiled } };
+    return { kind, id: compiled.definition.id, entry: { document, record, compiled } };
   }
   const compiled = compileWorkflow(document);
-  return { kind, id: compiled.id, entry: { document, compiled } };
+  return { kind, id: compiled.id, entry: { document, record, compiled } };
 }
 
 // Compiles every record in a batch. The caller decides whether a failed batch is an error or a preflight answer.
@@ -265,11 +269,28 @@ export function documentOf(catalog: Catalog, kind: ResourceKind, id: string): Re
   return entry?.document;
 }
 
+// The accepted legacy record for one id. A PATCH merges over it, as the reference does.
+export function storedRecordOf(catalog: Catalog, kind: ResourceKind, id: string): Readonly<Record<string, unknown>> | undefined {
+  const entry = kind === "endpoints" ? catalog.endpoints.get(id) : kind === "collections" ? catalog.collections.get(id) : catalog.workflows.get(id);
+  return entry?.record;
+}
+
+// Source metadata says where a record came from. A plain patch drops it so stale source cannot override the patch.
+const SOURCE_AUTHORING_FIELDS: ReadonlySet<string> = new Set(["authoringMode", "sourceFormat", "sourcePath", "sourceText", "sourceVersion"]);
+
+// The record a PATCH compiles: a source-backed patch replaces the stored record; a plain patch merges over it.
+export function patchedRecord(stored: Readonly<Record<string, unknown>> | undefined, incoming: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  if (stored === undefined || typeof incoming["sourceText"] === "string") return { ...incoming };
+  return { ...withoutKeys(stored, SOURCE_AUTHORING_FIELDS), ...incoming };
+}
+
 const INTERNAL_COLLECTIONS: readonly CollectionDefinition[] = [
   // Per-player heartbeat totals written by the stats route.
   { id: "_stats", collectionType: "per-steamid", accessMode: "endpoint", schema: { type: "object" } },
   // Analytics events, one record per event. Global so the per-player maxRecords limit does not apply.
   { id: "_analytics", collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
+  // Ledger rows for _ledger number fields. Only endpoint writes create them (endpoint/ledger.ts).
+  { id: LEDGER_COLLECTION, collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
 ];
 
 export function storageDefinitionOf(catalog: Catalog, values: ValuesDocument): StorageDefinition {
@@ -279,6 +300,24 @@ export function storageDefinitionOf(catalog: Catalog, values: ValuesDocument): S
     collections: [...INTERNAL_COLLECTIONS, ...user.filter((definition) => !reserved.has(definition.id))],
     values: flatValuesOf(values),
   };
+}
+
+// Dotted paths of the number fields marked _ledger on a per-steamid collection. Endpoint writes to these fields
+// append ledger rows. A global collection has no player to attribute a row to, so it has none.
+export function trackedFieldsOf(catalog: Catalog, collectionId: string): readonly string[] {
+  const entry = catalog.collections.get(collectionId);
+  if (entry === undefined) return [];
+  const collectionType = entry.compiled.definition.collectionType;
+  if (typeof collectionType === "string" && collectionType.toLowerCase() === "global") return [];
+  const fields: string[] = [];
+  for (const [path, markers] of entry.compiled.modifiers) {
+    if (!markers.includes("_ledger")) continue;
+    // A modifier path is "schema.properties.<name>" per level. Item paths have no field name and are not tracked.
+    const parts = path.split(".");
+    if (parts[0] !== "schema" || parts.includes("items")) continue;
+    fields.push(parts.slice(1).filter((part, index, all) => !(part === "properties" && index + 1 < all.length)).join("."));
+  }
+  return fields;
 }
 
 // Storage reads values by id: a group's entries under the group id, a table's rows under the table id.

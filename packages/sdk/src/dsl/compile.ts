@@ -1,7 +1,7 @@
 import type { EndpointHandler, EndpointRequest, Ns, WorkflowFunction } from "../endpoint/types.js";
 import type { CollectionDefinition } from "../storage/types.js";
 import { resolveTemplate } from "./expression.js";
-import { DslResponse, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
+import { DslResponse, newRunState, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
 
 // Compiles declarative YAML documents (endpoint, workflow, collection) into the handler shapes the engine runs.
 // Documents are validated up front, so a document that compiles never fails for structural reasons at runtime.
@@ -62,10 +62,11 @@ function checkSourceVersion(doc: Record<string, unknown>, kind: string, path: st
   if (doc["kind"] !== kind) throw new DefinitionError(`${path}.kind`, `must be "${kind}".`);
 }
 
-// Validates a step list recursively. Step ids must be unique across the whole document.
-function validateSteps(steps: unknown, path: string, seen: Set<string>): void {
+// Validates a step list recursively. Step ids must be unique across the whole document. A goto target must name a step
+// in this list or in an enclosing list (`enclosing`).
+function validateSteps(steps: unknown, path: string, seen: Set<string>, enclosing: readonly string[]): void {
   if (!Array.isArray(steps)) throw new DefinitionError(path, "must be an array.");
-  steps.forEach((raw, index) => {
+  const entries = steps.map((raw, index) => {
     const at = `${path}[${index}]`;
     const step = requireObject(raw, at);
     const id = requireId(step["id"], `${at}.id`);
@@ -75,18 +76,23 @@ function validateSteps(steps: unknown, path: string, seen: Set<string>): void {
     if (typeof type !== "string" || !STEP_TYPES.includes(type)) {
       throw new DefinitionError(`${at}.type`, `unsupported step type "${String(type)}".`);
     }
-    if (type === "block") validateSteps(step["steps"] ?? [], `${at}.steps`, seen);
-    if (step["routes"] !== undefined) validateRoutes(step["routes"], `${at}.routes`);
+    return { at, step, id, type };
   });
+  const visible = [...enclosing, ...entries.map((entry) => entry.id)];
+  for (const { at, step, type } of entries) {
+    if (type === "block") validateSteps(step["steps"] ?? [], `${at}.steps`, seen, visible);
+    if (step["routes"] !== undefined) validateRoutes(step["routes"], `${at}.routes`, visible);
+  }
 }
 
-function validateRoutes(routes: unknown, path: string): void {
+function validateRoutes(routes: unknown, path: string, visible: readonly string[]): void {
   const table = requireObject(routes, path);
   for (const [outcome, raw] of Object.entries(table)) {
     if (outcome !== "true" && outcome !== "false") throw new DefinitionError(`${path}.${outcome}`, "must be true or false.");
-    const route = requireObject(raw, `${path}.${outcome}`);
-    if (route["action"] !== "reject" && route["action"] !== "continue" && route["action"] !== "return") {
-      throw new DefinitionError(`${path}.${outcome}.action`, "must be reject, continue or return.");
+    const route = routeOf(raw, outcome === "true" ? "continue" : "reject");
+    if (route === null) throw new DefinitionError(`${path}.${outcome}`, "is not a valid route.");
+    if (route.action === "goto" && !visible.includes(route.target)) {
+      throw new DefinitionError(`${path}.${outcome}`, `goto target "${route.target}" is not a step in scope.`);
     }
   }
 }
@@ -161,7 +167,7 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
   }
   const requiresSecretKey = doc["requiresSecretKey"] === true;
   validateInputSchema(doc["input"], "endpoint.input");
-  validateSteps(doc["steps"] ?? [], "endpoint.steps", new Set());
+  validateSteps(doc["steps"] ?? [], "endpoint.steps", new Set(), []);
   const response = requireObject(doc["response"] ?? { status: 200, body: {} }, "endpoint.response");
   const steps = (doc["steps"] ?? []) as readonly StepDef[];
   const inputSchema = doc["input"];
@@ -173,7 +179,7 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
       steamId: req.player?.steamId ?? "anonymous",
       method: req.method,
     };
-    const state: RunState = { ns, scope, returned: false };
+    const state = newRunState(ns, scope);
     runSteps(steps, state);
     return renderResponse(response, state);
   };
@@ -187,7 +193,7 @@ export function compileWorkflow(source: unknown): CompiledWorkflow {
   const id = requireId(doc["id"], "workflow.id");
   const body = requireObject(doc["definition"], "workflow.definition");
   const params = body["params"] === undefined ? {} : requireObject(body["params"], "workflow.definition.params");
-  validateSteps(body["steps"] ?? [], "workflow.definition.steps", new Set());
+  validateSteps(body["steps"] ?? [], "workflow.definition.steps", new Set(), []);
   const steps = (body["steps"] ?? []) as readonly StepDef[];
   const returns = body["returns"] ?? {};
 
@@ -200,7 +206,7 @@ export function compileWorkflow(source: unknown): CompiledWorkflow {
       }
       scope[name] = input[name];
     }
-    const state: RunState = { ns, scope, returned: false };
+    const state = newRunState(ns, scope);
     runSteps(steps, state);
     return resolveTemplate(returns, scope, scopeOf(ns));
   };

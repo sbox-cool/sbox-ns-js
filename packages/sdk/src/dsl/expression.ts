@@ -290,6 +290,9 @@ function requireArgs(name: string, args: unknown[], count: number): void {
 export interface EvalOptions {
   // Clock for now()/nowS()/hour()/dayOfWeek(). Injected so evaluation stays deterministic in tests.
   now?: () => number;
+  // Throws `Unresolved variable` for an unknown name and `has no property` for a missing member instead of
+  // yielding undefined. Compute steps use it to defer a value until the keys it reads have been computed.
+  strict?: boolean;
 }
 
 class Evaluator {
@@ -302,15 +305,22 @@ class Evaluator {
     switch (node.t) {
       case "lit":
         return node.v;
-      case "path":
+      case "path": {
         if (Object.prototype.hasOwnProperty.call(locals, node.name)) return locals[node.name];
-        return Object.prototype.hasOwnProperty.call(this.scope, node.name) ? this.scope[node.name] : undefined;
+        if (Object.prototype.hasOwnProperty.call(this.scope, node.name)) return this.scope[node.name];
+        if (this.options.strict === true) throw new ExpressionError(`Unresolved variable "${node.name}"`);
+        return undefined;
+      }
       case "member": {
         const obj = this.eval(node.obj, locals);
         if (obj === null || obj === undefined) return undefined;
         const prop = typeof node.key === "string" ? node.key : this.eval(node.key, locals);
         if (Array.isArray(obj) && typeof prop === "number") return obj[prop];
-        if (typeof obj === "object") return Reflect.get(obj, String(prop));
+        if (typeof obj === "object") {
+          const key = String(prop);
+          if (this.options.strict === true && !(key in obj)) throw new ExpressionError(`"${key}" has no property`);
+          return Reflect.get(obj, key);
+        }
         return undefined;
       }
       case "unary": {

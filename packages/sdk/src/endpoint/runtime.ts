@@ -1,5 +1,6 @@
 import type { EndpointStorage, ExpectedVersion, RecordData, RecordWrite, StoredRecord, VersionedRecord } from "../storage/index.js";
 import { isRecord } from "../util/guards.js";
+import { ledgerWritesOf } from "./ledger.js";
 import {
   FETCH_LIMITS,
   FetchError,
@@ -11,6 +12,7 @@ import {
   sendFetch,
 } from "./fetch.js";
 import type { EndpointGlobal, EndpointHandler, EndpointRequest, FetchOptions, FetchResponse, Ns, WorkflowFunction } from "./types.js";
+import { RUN_INTERNALS, type ExecutionMode, type RunInternals } from "./execution.js";
 
 // Thrown by ns.fail(). The backend maps it to a status and an error body.
 export class ScriptFailure extends Error {
@@ -44,9 +46,13 @@ export interface RunEnvironment {
   globals: Readonly<Record<string, Readonly<Record<string, EndpointGlobal>>>>;
   secrets: SecretStore;
   now: () => number;
+  // Dotted paths of the number fields marked _ledger on a collection. Empty for collections that are not ledgered.
+  trackedFields: (collection: string) => readonly string[];
   log: (value: unknown) => void;
   // Aborts pending outbound requests and stops further passes.
   signal?: AbortSignal;
+  // "scripted" runs never wait on sleep or send webhooks; see execution.ts.
+  execution: ExecutionMode;
 }
 
 export interface RunOutcome {
@@ -72,12 +78,12 @@ export async function runEndpoint(
   request: EndpointRequest,
   env: RunEnvironment,
 ): Promise<RunOutcome> {
-  const completed = new Map<string, FetchOutcome>();
+  const memo: RunMemo = { fetches: new Map(), results: new Map() };
   const state: RunState = { records: new Map(), lists: new Map(), values: new Map(), secrets: new Map() };
   let stateRounds = 0;
   for (;;) {
     throwIfCancelled(env.signal);
-    const pass = new Pass(env, state, completed);
+    const pass = new Pass(env, state, memo);
     let value: unknown;
     let failure: { error: unknown } | null = null;
     try {
@@ -116,12 +122,30 @@ export async function runEndpoint(
           async ([key, call]) => [key, await sendFetch(call, env.fetchPolicy, env.signal)] as const,
         ),
       );
-      for (const [key, outcome] of sent) completed.set(key, outcome);
+      for (const [key, outcome] of sent) memo.fetches.set(key, outcome);
+      continue;
+    }
+    if (pass.suspension !== null) {
+      const { key, perform } = pass.suspension;
+      memo.results.set(key, await perform(env.signal));
       continue;
     }
     if (failure !== null) throw failure.error;
     for (const entry of pass.logs) env.log(entry);
-    return { value, writes: pass.writes.stagedWrites(), expectedVersions: pass.writes.expectedVersions() };
+    const staged = pass.writes.stagedWrites();
+    const ledger = ledgerWritesOf({
+      writes: staged,
+      before: (collection, key) => state.records.get(stagedKey(collection, key))?.data ?? null,
+      trackedFields: env.trackedFields,
+      source: request.endpoint,
+      now: env.now(),
+      newId: () => crypto.randomUUID().replaceAll("-", ""),
+    });
+    return {
+      value,
+      writes: [...staged, ...ledger.writes],
+      expectedVersions: [...pass.writes.expectedVersions(), ...ledger.expectedVersions],
+    };
   }
 }
 
@@ -141,6 +165,18 @@ interface RunState {
   secrets: Map<string, string | null>;
 }
 
+// Results shared across the passes of one run.
+interface RunMemo {
+  // Outbound responses, keyed by request.
+  fetches: Map<string, FetchOutcome>;
+  // Memoized computations and performed effects, keyed by name and occurrence.
+  results: Map<string, unknown>;
+}
+
+// Thrown when the handler reaches an effect the run has not performed yet. The pass is discarded.
+class Suspended extends Error {}
+const SUSPENDED = new Suspended("effect pending");
+
 // State for one pass of the handler.
 class Pass {
   readonly pending = new Map<string, ParsedFetch>();
@@ -150,14 +186,17 @@ class Pass {
   readonly ns: Ns;
   private readonly env: RunEnvironment;
   private readonly state: RunState;
-  private readonly completed: Map<string, FetchOutcome>;
+  private readonly memo: RunMemo;
+  private readonly occurrences = new Map<string, number>();
+  suspension: { key: string; perform: (signal: AbortSignal | undefined) => Promise<unknown> } | null = null;
 
-  constructor(env: RunEnvironment, state: RunState, completed: Map<string, FetchOutcome>) {
+  constructor(env: RunEnvironment, state: RunState, memo: RunMemo) {
     this.env = env;
     this.state = state;
-    this.completed = completed;
+    this.memo = memo;
     this.writes = new RecordOverlay(env, state, this.needs);
     this.ns = this.buildNs();
+    Object.defineProperty(this.ns, RUN_INTERNALS, { value: this.internals() });
   }
 
   private buildNs(): Ns {
@@ -186,6 +225,36 @@ class Pass {
       },
       fetch: (url, options) => this.fetch(url, options),
     };
+  }
+
+  // Internal channel for the DSL interpreter, bound to this pass and to the run's memo.
+  private internals(): RunInternals {
+    return {
+      mode: this.env.execution,
+      memo: <T>(name: string, compute: () => T): T => {
+        const key = this.occurrenceKey(name);
+        if (this.memo.results.has(key)) return this.memo.results.get(key) as T;
+        const value = compute();
+        this.memo.results.set(key, value);
+        return value;
+      },
+      effect: <T>(name: string, perform: (signal: AbortSignal | undefined) => Promise<T>): T => {
+        const key = this.occurrenceKey(name);
+        if (this.memo.results.has(key)) return this.memo.results.get(key) as T;
+        if (this.env.execution === "scripted") {
+          throw new TypeError(`ns: effect "${name}" is not available to scripted runs.`);
+        }
+        this.suspension ??= { key, perform };
+        throw SUSPENDED;
+      },
+    };
+  }
+
+  // Each call of a name within one pass takes the next occurrence number, so the same call in every pass maps to the same key.
+  private occurrenceKey(name: string): string {
+    const occurrence = this.occurrences.get(name) ?? 0;
+    this.occurrences.set(name, occurrence + 1);
+    return JSON.stringify([name, occurrence]);
   }
 
   // Workflow writes are rolled back when the workflow throws, so a failed workflow never leaves partial
@@ -238,11 +307,11 @@ class Pass {
 
   private fetch(url: string, options: FetchOptions | undefined): FetchResponse | null {
     const call = parseFetchCall(url, options);
-    const done = this.completed.get(call.key);
+    const done = this.memo.fetches.get(call.key);
     if (done !== undefined) return deliver(done);
     const refusal = refuseHost(call.host, this.env.fetchPolicy);
     if (refusal !== null) throw new FetchError(refusal.code, refusal.message);
-    if (this.completed.size + this.pending.size >= FETCH_LIMITS.maxRequestsPerExecution) {
+    if (this.memo.fetches.size + this.pending.size >= FETCH_LIMITS.maxRequestsPerExecution) {
       throw new FetchError(
         "FETCH_LIMIT_EXCEEDED",
         `ns.fetch: one execution may make at most ${FETCH_LIMITS.maxRequestsPerExecution} outbound requests.`,

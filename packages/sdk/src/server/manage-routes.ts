@@ -6,6 +6,8 @@ import {
   compileBatch,
   deleteResource,
   documentOf,
+  patchedRecord,
+  storedRecordOf,
   upsertGameValues,
   type BatchCompile,
   type RecordResult,
@@ -150,10 +152,35 @@ function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "pre
 
 // Builds the response for a set of sections. A failing section returns 400 and nothing is committed by the caller.
 function sectionsResponse(ctx: ServerContext, sections: readonly Section[], mode: "sync" | "preflight"): Response {
-  const body: Record<string, unknown> = {};
-  for (const section of sections) body[section.kind] = sectionReport(ctx, section, mode);
+  const reports: Record<string, Record<string, unknown>> = {};
+  for (const section of sections) reports[section.kind] = sectionReport(ctx, section, mode);
   const ok = sections.every((section) => section.report.ok);
-  return jsonResponse(mode === "sync" ? { ok, source: "candidate", ...body } : { ok, ...body }, ok ? 200 : 400);
+  if (mode === "preflight") return preflightResponse(reports, ok);
+  return jsonResponse({ ok, source: "candidate", ...reports }, ok ? 200 : 400);
+}
+
+// The reference's preflight envelope: mode, publish target, a summary across sections, and a top-level error when
+// any section fails.
+function preflightResponse(reports: Record<string, Record<string, unknown>>, ok: boolean): Response {
+  const values = Object.values(reports);
+  const sum = (key: string): number =>
+    values.reduce((total, report) => {
+      const count = report[key];
+      return typeof count === "number" ? total + count : total;
+    }, 0);
+  const failed = sum("failed");
+  const warnings = sum("warnings");
+  const nextAction =
+    failed > 0
+      ? "Fix the listed validation errors, then retry Push All."
+      : warnings > 0
+        ? "Review warnings, then Push All can proceed."
+        : "Push All can proceed.";
+  const outcome = ok
+    ? { message: "Preflight validation passed. No resources were written." }
+    : { error: "PREFLIGHT_VALIDATION_FAILED", message: "Preflight validation failed. No resources were written." };
+  const summary = { total: sum("total"), success: sum("passed"), failed, warnings, nextAction };
+  return jsonResponse({ ok, mode: "preflight", publishTarget: "live", ...reports, summary, ...outcome }, ok ? 200 : 400);
 }
 
 function documentsOf(ctx: ServerContext, kind: ResourceKind): unknown[] {
@@ -301,9 +328,9 @@ async function kindRoute(
     const first = compileSection(ctx, kind, [incoming]);
     const [only] = first.batch?.compiled ?? [];
     if (only === undefined || !first.report.ok) return writeFailure(kind, first.report.message);
-    // Merge the patch over the stored definition, then recompile the whole definition.
+    // Merge the patch over the stored record, then recompile the whole record.
     const existing = documentOf(ctx.catalog, kind, only.id);
-    const merged = existing === undefined ? incoming : { ...existing, ...incoming };
+    const merged = patchedRecord(storedRecordOf(ctx.catalog, kind, only.id), incoming);
     const section = compileSection(ctx, kind, [merged]);
     const [item] = section.batch?.compiled ?? [];
     if (item === undefined || !section.report.ok) return writeFailure(kind, section.report.message);
