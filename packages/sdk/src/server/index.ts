@@ -57,7 +57,7 @@ function splitRoute(parts: readonly string[]): SplitRoute | null {
 const NOT_FOUND = { status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." } as const;
 
 // Capabilities this server implements. Add a name only when its behaviour is complete.
-const SERVER_CAPABILITIES = ["library-error-envelope"] as const;
+const SERVER_CAPABILITIES = ["library-error-envelope", "management-sync-jobs"] as const;
 
 async function route(ctx: ServerContext, request: Request): Promise<Response> {
   const url = new URL(request.url);

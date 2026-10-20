@@ -1,6 +1,6 @@
 import { DslResponse } from "../dsl/steps.js";
 import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
-import { trackedFieldsOf } from "./catalog.js";
+import { trackedFieldsOf, type Catalog } from "./catalog.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { openV1Envelope } from "../protocol/envelope-v1.js";
 import { openV2Envelope, sealV2Response, type V2ResponseKey } from "../protocol/envelope-v2.js";
@@ -14,6 +14,7 @@ import { verifyAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
+import { targetsNext } from "./publish-target.js";
 import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
 import type { EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
@@ -28,12 +29,13 @@ const NO_SECRETS: SecretStore = { get: () => null };
 // Static endpoints from ServerOptions first, then the endpoints the editor pushed (compiled from DSL documents).
 function resolveEndpoint(
   ctx: ServerContext,
+  catalog: Catalog,
   slug: string,
 ): { handler: EndpointHandler; requiresSecretKey: boolean; execution: ExecutionMode } | null {
   if (Object.hasOwn(ctx.options.endpoints, slug)) {
     return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false, execution: "scripted" };
   }
-  const entry = ctx.catalog.endpoints.get(slug);
+  const entry = catalog.endpoints.get(slug);
   if (entry === undefined || !entry.enabled) return null;
   return {
     handler: entry.compiled.handler,
@@ -43,9 +45,9 @@ function resolveEndpoint(
 }
 
 // Static workflows from ServerOptions, overridden by the workflows the editor pushed.
-function workflowsOf(ctx: ServerContext): Record<string, WorkflowFunction> {
+function workflowsOf(ctx: ServerContext, catalog: Catalog): Record<string, WorkflowFunction> {
   const workflows: Record<string, WorkflowFunction> = { ...ctx.options.workflows };
-  for (const [id, entry] of ctx.catalog.workflows) workflows[id] = entry.compiled.definition;
+  for (const [id, entry] of catalog.workflows) workflows[id] = entry.compiled.definition;
   return workflows;
 }
 
@@ -122,7 +124,8 @@ async function runCall(
   const { options } = ctx;
   const envelope = body !== null && isEncryptedBody(body) ? body : null;
   const slug = resolveSlug(pathSlug, body, envelope !== null);
-  const target = resolveEndpoint(ctx, slug);
+  const view = ctx.view(targetsNext(request, url));
+  const target = resolveEndpoint(ctx, view.catalog, slug);
   if (target === null) {
     throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `No endpoint named "${slug}".`);
   }
@@ -223,20 +226,20 @@ async function runCall(
       revision: null,
     },
     {
-      storage: ctx.storage(),
+      storage: view.storage,
       execution: target.execution,
       fetchPolicy: options.fetchPolicy,
-      workflows: workflowsOf(ctx),
+      workflows: workflowsOf(ctx, view.catalog),
       globals: options.globals ?? {},
       secrets: options.secrets ?? NO_SECRETS,
       now: ctx.now,
-      trackedFields: (collection) => trackedFieldsOf(ctx.catalog, collection),
+      trackedFields: (collection) => trackedFieldsOf(view.catalog, collection),
       log: options.log ?? (() => undefined),
       signal: request.signal,
     },
   );
   if (outcome.writes.length > 0) {
-    await ctx.storage().apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
+    await view.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
   }
 
   // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.

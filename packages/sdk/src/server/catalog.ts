@@ -62,6 +62,8 @@ export interface Catalog {
   rateLimitRules: Record<string, unknown>[];
   tests: Record<string, unknown>[];
   gamePackage: Record<string, unknown> | null;
+  // The staged ("next") revision: records written with a next target, keyed by id, waiting for promotion.
+  readonly staged: { readonly endpoints: Map<string, Record<string, unknown>>; readonly collections: Map<string, Record<string, unknown>> };
 }
 
 export function createCatalog(): Catalog {
@@ -75,6 +77,7 @@ export function createCatalog(): Catalog {
     rateLimitRules: [],
     tests: [],
     gamePackage: null,
+    staged: { endpoints: new Map(), collections: new Map() },
   };
 }
 
@@ -242,6 +245,113 @@ export function commitCompiled(catalog: Catalog, items: readonly Compiled[]): vo
     else catalog.workflows.set(item.id, item.entry);
   }
   catalog.revision += 1;
+}
+
+// Writes compiled items to the live catalog, or to the staged revision for a next-targeted write. Workflows have no
+// staged revision and always write live.
+export function writeCompiled(catalog: Catalog, items: readonly Compiled[], staged: boolean): void {
+  if (!staged) {
+    commitCompiled(catalog, items);
+    return;
+  }
+  const next = items.filter(isStagedItem);
+  const live = items.filter((item) => !isStagedItem(item));
+  if (next.length > 0) stageCompiled(catalog, next);
+  if (live.length > 0) commitCompiled(catalog, live);
+}
+
+type StagedItem = Extract<Compiled, { readonly kind: "endpoints" | "collections" }>;
+
+function isStagedItem(item: Compiled): item is StagedItem {
+  return item.kind !== "workflows";
+}
+
+function stageCompiled(catalog: Catalog, items: readonly StagedItem[]): void {
+  for (const item of items) {
+    const { record } = item.entry;
+    const stored = record["id"] === undefined ? { ...record, id: item.id } : record;
+    (item.kind === "endpoints" ? catalog.staged.endpoints : catalog.staged.collections).set(item.id, stored);
+  }
+  catalog.revision += 1;
+}
+
+// The staged record for one id. Workflows never have one.
+export function stagedRecordOf(
+  catalog: Catalog,
+  kind: ResourceKind,
+  id: string,
+): Readonly<Record<string, unknown>> | undefined {
+  if (kind === "endpoints") return catalog.staged.endpoints.get(id);
+  if (kind === "collections") return catalog.staged.collections.get(id);
+  return undefined;
+}
+
+export interface StagedCompile {
+  readonly ok: boolean;
+  readonly message: string | null;
+  readonly compiled: readonly Compiled[];
+}
+
+// The staged revision as a run or a promotion sees it: each staged record merged over its live counterpart, then compiled.
+function compileStaged(catalog: Catalog, parse: Parser): StagedCompile {
+  const endpoints = compileBatch(
+    "endpoints",
+    [...catalog.staged.endpoints].map(([id, record]) => patchedRecord(catalog.endpoints.get(id)?.record, record)),
+    parse,
+  );
+  const collections = compileBatch(
+    "collections",
+    [...catalog.staged.collections].map(([id, record]) => patchedRecord(catalog.collections.get(id)?.record, record)),
+    parse,
+  );
+  const failure = [...endpoints.results, ...collections.results].find((result) => !result.ok);
+  return {
+    ok: endpoints.ok && collections.ok,
+    message: failure?.message ?? null,
+    compiled: [...endpoints.compiled, ...collections.compiled],
+  };
+}
+
+// The catalog a next-targeted run reads: staged records replace or add to the live ones. Returns the live catalog
+// itself when nothing is staged. Throws when the staged revision does not compile, since nothing can run it.
+export function stagedCatalogOf(catalog: Catalog, parse: Parser): Catalog {
+  if (catalog.staged.endpoints.size === 0 && catalog.staged.collections.size === 0) return catalog;
+  const staged = compileStaged(catalog, parse);
+  if (!staged.ok) throw new Error(`The staged revision does not compile: ${staged.message ?? "unknown error"}`);
+  const endpoints = new Map(catalog.endpoints);
+  const collections = new Map(catalog.collections);
+  for (const item of staged.compiled) {
+    if (item.kind === "endpoints") endpoints.set(item.id, item.entry);
+    else if (item.kind === "collections") collections.set(item.id, item.entry);
+  }
+  return { ...catalog, endpoints, collections };
+}
+
+export interface PromotionResult {
+  readonly endpointCount: number;
+  readonly collectionCount: number;
+  readonly promoted: boolean;
+}
+
+// Promotes the staged revision into the live catalog. Nothing is written unless every staged record compiles; a failed
+// promotion keeps the staged revision so it can be fixed and promoted again.
+export function promoteStaged(catalog: Catalog, parse: Parser): PromotionResult {
+  const endpointCount = catalog.staged.endpoints.size;
+  const collectionCount = catalog.staged.collections.size;
+  if (endpointCount + collectionCount === 0) return { endpointCount: 0, collectionCount: 0, promoted: false };
+  const staged = compileStaged(catalog, parse);
+  if (!staged.ok) return { endpointCount: 0, collectionCount: 0, promoted: false };
+  commitCompiled(catalog, staged.compiled);
+  catalog.staged.endpoints.clear();
+  catalog.staged.collections.clear();
+  return { endpointCount, collectionCount, promoted: true };
+}
+
+// A full replacement removes the live endpoints the push did not name.
+export function removeEndpoints(catalog: Catalog, keep: ReadonlySet<string>): void {
+  for (const id of [...catalog.endpoints.keys()]) {
+    if (!keep.has(id)) deleteResource(catalog, "endpoints", id);
+  }
 }
 
 export function deleteResource(catalog: Catalog, kind: ResourceKind, id: string): boolean {

@@ -2,21 +2,26 @@ import { ProtocolError } from "../protocol/errors.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import {
-  commitCompiled,
   compileBatch,
   deleteResource,
+  documentFor,
   documentOf,
   patchedRecord,
+  promoteStaged,
+  stagedRecordOf,
   storedRecordOf,
   upsertGameValues,
+  writeCompiled,
   type BatchCompile,
   type RecordResult,
   type ResourceKind,
 } from "./catalog.js";
 import type { ServerContext } from "./context.js";
 import { authorize, handleEndpoint } from "./endpoints.js";
-import { pathSegment, readJsonBody, readJsonValue, safeEqual } from "./http.js";
+import { pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
+import { PUBLISH_TARGET_HEADER, decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
 import { parseQuery, type QueryDefinition } from "./query-routes.js";
+import { SYNC_JOB_MESSAGE_ACCEPTED, startEndpointSync, writeEndpointBatch } from "./sync-jobs.js";
 import { upgradeSource } from "./source-upgrade.js";
 
 // Editor-facing management API. Every route needs the secret key except revision-init, which the game client
@@ -139,17 +144,26 @@ function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "pre
 }
 
 // Builds the response for a set of sections. A failing section returns 400 and nothing is committed by the caller.
-function sectionsResponse(ctx: ServerContext, sections: readonly Section[], mode: "sync" | "preflight"): Response {
+function sectionsResponse(
+  ctx: ServerContext,
+  sections: readonly Section[],
+  mode: "sync" | "preflight",
+  decision: PublishDecision,
+): Response {
   const reports: Record<string, Record<string, unknown>> = {};
   for (const section of sections) reports[section.kind] = sectionReport(ctx, section, mode);
   const ok = sections.every((section) => section.report.ok);
-  if (mode === "preflight") return preflightResponse(reports, ok);
-  return jsonResponse({ ok, source: "candidate", ...reports }, ok ? 200 : 400);
+  if (mode === "preflight") return preflightResponse(reports, ok, decision === "staged" ? "next" : "live");
+  return jsonResponse(withPublishTarget({ ok, source: "candidate", ...reports }, decision), ok ? 200 : 400);
 }
 
 // The reference's preflight envelope: mode, publish target, a summary across sections, and a top-level error when
 // any section fails.
-function preflightResponse(reports: Record<string, Record<string, unknown>>, ok: boolean): Response {
+function preflightResponse(
+  reports: Record<string, Record<string, unknown>>,
+  ok: boolean,
+  publishTarget: "live" | "next",
+): Response {
   const values = Object.values(reports);
   const sum = (key: string): number =>
     values.reduce((total, report) => {
@@ -168,15 +182,36 @@ function preflightResponse(reports: Record<string, Record<string, unknown>>, ok:
     ? { message: "Preflight validation passed. No resources were written." }
     : { error: "PREFLIGHT_VALIDATION_FAILED", message: "Preflight validation failed. No resources were written." };
   const summary = { total: sum("total"), success: sum("passed"), failed, warnings, nextAction };
-  return jsonResponse({ ok, mode: "preflight", publishTarget: "live", ...reports, summary, ...outcome }, ok ? 200 : 400);
+  return jsonResponse({ ok, mode: "preflight", publishTarget, ...reports, summary, ...outcome }, ok ? 200 : 400);
 }
 
-function documentsOf(ctx: ServerContext, kind: ResourceKind): unknown[] {
+// The documents a list returns. With includeStaged, the staged copies follow the live documents, marked as the next
+// revision. Workflows have no staged revision.
+function documentsOf(ctx: ServerContext, kind: ResourceKind, includeStaged: boolean): unknown[] {
+  let documents: unknown[];
   if (kind === "endpoints") {
-    return [...ctx.catalog.endpoints.values()].map((entry) => ({ ...entry.document, enabled: entry.enabled }));
+    documents = [...ctx.catalog.endpoints.values()].map((entry) => ({ ...entry.document, enabled: entry.enabled }));
+  } else if (kind === "collections") {
+    documents = [...ctx.catalog.collections.values()].map((entry) => entry.document);
+  } else {
+    return [...ctx.catalog.workflows.values()].map((entry) => entry.document);
   }
-  if (kind === "collections") return [...ctx.catalog.collections.values()].map((entry) => entry.document);
-  return [...ctx.catalog.workflows.values()].map((entry) => entry.document);
+  if (!includeStaged) return documents;
+  const staged = kind === "endpoints" ? ctx.catalog.staged.endpoints : ctx.catalog.staged.collections;
+  const copies = [...staged.values()].map((record) => {
+    const document = documentFor(kind, record, ctx.options.parseYaml);
+    return kind === "endpoints"
+      ? { ...document, enabled: record["enabled"] !== false, revisionTarget: "next" }
+      : { ...document, revisionTarget: "next" };
+  });
+  return [...documents, ...copies];
+}
+
+// Staged copies join a list only when asked for with includeStaged=true; revisionTarget=live keeps the list live.
+function includeStagedOf(url: URL): boolean {
+  if (url.searchParams.get("revisionTarget")?.trim().toLowerCase() === "live") return false;
+  const flag = url.searchParams.get("includeStaged")?.trim().toLowerCase();
+  return flag === "true" || flag === "1";
 }
 
 export async function handleManage(
@@ -216,12 +251,11 @@ export async function handleManage(
   }
   if (head === "game-values" && rest.length === 1) return gameValuesRoute(ctx, request);
   if (head === "sync" && second === "preflight" && rest.length === 2 && method === "POST") {
-    return preflight(ctx, request);
+    return preflight(ctx, request, url);
   }
-  if (head === "sync" && rest.length === 1 && method === "PUT") return syncAll(ctx, request);
+  if (head === "sync" && rest.length === 1 && method === "PUT") return syncAll(ctx, request, url);
   if (head === "sync-jobs" && rest.length === 2 && method === "GET") {
-    // Sync runs synchronously and keeps no job history, so no job exists to report.
-    return jsonResponse({ ok: true, jobId: pathSegment(second ?? ""), found: false }, 200);
+    return syncJobRoute(ctx, pathSegment(second ?? ""));
   }
   if (head === "package-sync" && rest.length === 1 && method === "POST") return packageSync(ctx, request);
   if (head === "game-package" && rest.length === 1 && method === "GET") {
@@ -243,7 +277,7 @@ export async function handleManage(
   if (head === "rate-limit-rules" && rest.length === 1 && method === "PUT") return putRateLimits(ctx, request);
   if (head === "queries") return queriesRoute(ctx, request, rest);
   const kind = kindOfPath(head);
-  if (kind !== null) return kindRoute(ctx, request, kind, rest);
+  if (kind !== null) return kindRoute(ctx, request, url, kind, rest);
   throw noRoute();
 }
 
@@ -264,72 +298,105 @@ async function gameValuesRoute(ctx: ServerContext, request: Request): Promise<Re
   return jsonResponse({ ok: true, action: "upsert", resourceKind: "game-values", source: "candidate" }, 200);
 }
 
-async function preflight(ctx: ServerContext, request: Request): Promise<Response> {
+async function preflight(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   const body = await readJsonBody(request);
   const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
-  return sectionsResponse(ctx, sections, "preflight");
+  return sectionsResponse(ctx, sections, "preflight", targetsNext(request, url) ? "staged" : "live");
 }
 
-async function syncAll(ctx: ServerContext, request: Request): Promise<Response> {
+async function syncAll(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   const body = await readJsonBody(request);
+  const decision = decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
   const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
   // All-or-nothing across kinds: nothing is committed unless every section compiled.
   if (sections.every((section) => section.report.ok)) {
     for (const section of sections) {
-      if (section.batch !== null) commitCompiled(ctx.catalog, section.batch.compiled);
+      if (section.batch !== null) writeCompiled(ctx.catalog, section.batch.compiled, decision === "staged");
     }
   }
-  return sectionsResponse(ctx, sections, "sync");
+  return sectionsResponse(ctx, sections, "sync", decision);
 }
 
 // A failed write answers 400 with the reference's error envelope and commits nothing.
-function writeFailure(kind: ResourceKind, message: string | null): Response {
+function writeFailure(kind: ResourceKind, message: string | null, decision: PublishDecision = "live"): Response {
   return jsonResponse(
-    { ok: false, resourceKind: KIND_LABEL[kind], error: { code: "VALIDATION_FAILED", message: message ?? "Validation failed." } },
+    withPublishTarget(
+      { ok: false, resourceKind: KIND_LABEL[kind], error: { code: "VALIDATION_FAILED", message: message ?? "Validation failed." } },
+      decision,
+    ),
     400,
   );
+}
+
+// PUT endpoints?async=true. The body is parsed and written by a background job that the caller polls. The reference
+// answers 202 without a publish target.
+async function asyncEndpointSync(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
+  const text = await readBodyText(request);
+  const decision = decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
+  const jobId = startEndpointSync(ctx, text, decision, url.searchParams.get("replaceAll") === "true");
+  return jsonResponse({ ok: true, jobId, status: "accepted", message: SYNC_JOB_MESSAGE_ACCEPTED }, 202);
 }
 
 async function kindRoute(
   ctx: ServerContext,
   request: Request,
+  url: URL,
   kind: ResourceKind,
   rest: readonly string[],
 ): Promise<Response> {
   const method = request.method;
   const label = KIND_LABEL[kind];
   if (rest.length === 1 && method === "GET") {
-    return jsonResponse({ ok: true, data: documentsOf(ctx, kind) }, 200);
+    return jsonResponse({ ok: true, data: documentsOf(ctx, kind, includeStagedOf(url)) }, 200);
   }
+  // Workflows have no staged revision and always publish live.
+  const decision: PublishDecision =
+    kind === "workflows" ? "live" : decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
+  const staged = decision === "staged";
   if (rest.length === 1 && method === "PUT") {
+    if (kind === "endpoints" && url.searchParams.get("async") === "true") {
+      return asyncEndpointSync(ctx, request, url);
+    }
     const section = compileSection(ctx, kind, await readJsonValue(request));
-    if (section.batch === null || !section.report.ok) return writeFailure(kind, section.report.message);
-    commitCompiled(ctx.catalog, section.batch.compiled);
+    if (section.batch === null || !section.report.ok) return writeFailure(kind, section.report.message, decision);
+    if (kind === "endpoints") {
+      writeEndpointBatch(ctx.catalog, section.batch.compiled, staged, url.searchParams.get("replaceAll") === "true");
+    } else {
+      writeCompiled(ctx.catalog, section.batch.compiled, staged);
+    }
     const results = section.batch.compiled.map((item) => ({ action: "upsert", ok: true, resourceId: item.id, resourceKind: label }));
-    return jsonResponse({ ok: true, resourceKind: label, results, source: "candidate" }, 200);
+    return jsonResponse(withPublishTarget({ ok: true, resourceKind: label, results, source: "candidate" }, decision), 200);
   }
   if (rest.length === 1 && method === "PATCH") {
     const value = await readJsonValue(request);
     // A single resource may arrive bare or nested under its kind name.
     const incoming = isRecord(value) && isRecord(value[label]) && value["id"] === undefined ? value[label] : value;
-    if (!isRecord(incoming)) return writeFailure(kind, `Body must contain a ${label} object.`);
+    if (!isRecord(incoming)) return writeFailure(kind, `Body must contain a ${label} object.`, decision);
     const first = compileSection(ctx, kind, [incoming]);
     const [only] = first.batch?.compiled ?? [];
-    if (only === undefined || !first.report.ok) return writeFailure(kind, first.report.message);
-    // Merge the patch over the stored record, then recompile the whole record.
-    const existing = documentOf(ctx.catalog, kind, only.id);
-    const merged = patchedRecord(storedRecordOf(ctx.catalog, kind, only.id), incoming);
+    if (only === undefined || !first.report.ok) return writeFailure(kind, first.report.message, decision);
+    // A staged patch merges over the staged copy when one exists, otherwise over the stored record. The existing
+    // document is the one the patch applies to, so it decides between created, updated and unchanged.
+    const stagedRecord = staged ? stagedRecordOf(ctx.catalog, kind, only.id) : undefined;
+    const existing =
+      stagedRecord === undefined
+        ? documentOf(ctx.catalog, kind, only.id)
+        : documentFor(kind, stagedRecord, ctx.options.parseYaml);
+    const merged = patchedRecord(stagedRecord ?? storedRecordOf(ctx.catalog, kind, only.id), incoming);
     const section = compileSection(ctx, kind, [merged]);
     const [item] = section.batch?.compiled ?? [];
-    if (item === undefined || !section.report.ok) return writeFailure(kind, section.report.message);
+    if (item === undefined || !section.report.ok) return writeFailure(kind, section.report.message, decision);
     const action =
       existing === undefined
         ? "created"
         : JSON.stringify(existing) === JSON.stringify(item.entry.document)
           ? "unchanged"
           : "updated";
-    if (action !== "unchanged") commitCompiled(ctx.catalog, [item]);
-    return jsonResponse({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action }, 200);
+    if (action !== "unchanged") writeCompiled(ctx.catalog, [item], staged);
+    return jsonResponse(
+      withPublishTarget({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action }, decision),
+      200,
+    );
   }
   const id = rest[1];
   if (rest.length === 2 && id !== undefined && method === "DELETE") {
@@ -406,6 +473,7 @@ async function runTest(
   url: URL,
   secret: string,
   test: Record<string, unknown>,
+  next: boolean,
 ): Promise<TestResult> {
   const id = typeof test["id"] === "string" ? test["id"] : "";
   const endpoint = typeof test["endpoint"] === "string" ? test["endpoint"] : "";
@@ -414,7 +482,7 @@ async function runTest(
   const wanted = typeof expect["status"] === "number" ? expect["status"] : 200;
   const call = new Request(url, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-secret-key": secret },
+    headers: { "content-type": "application/json", "x-secret-key": secret, ...(next ? { [PUBLISH_TARGET_HEADER]: "next" } : {}) },
     body: JSON.stringify(input),
   });
   const response = await handleEndpoint(ctx, call, url, endpoint);
@@ -429,7 +497,7 @@ async function autoTest(ctx: ServerContext, request: Request, url: URL): Promise
   const slug = typeof body["slug"] === "string" ? body["slug"] : null;
   const selected = ctx.catalog.tests.filter((test) => slug === null || test["endpoint"] === slug);
   const results: TestResult[] = [];
-  for (const test of selected) results.push(await runTest(ctx, url, secret, test));
+  for (const test of selected) results.push(await runTest(ctx, url, secret, test, targetsNext(request, url)));
   const failed = results.filter((result) => !result.ok).length;
   return jsonResponse({ ok: failed === 0, passed: results.length - failed, failed, results }, 200);
 }
@@ -444,6 +512,18 @@ async function sourceUpgrade(ctx: ServerContext, request: Request): Promise<Resp
   return jsonResponse(outcome.body, outcome.ok ? 200 : 400);
 }
 
+// A sync job while the server keeps it. The reference answers a blank id, an expired job, and an unknown job with
+// distinct codes; an expired job is forgotten once it has been reported.
+function syncJobRoute(ctx: ServerContext, jobId: string): Response {
+  if (jobId.trim() === "") return jsonResponse({ ok: false, error: "MISSING_JOB_ID" }, 400);
+  const lookup = ctx.syncJobs.lookup(jobId);
+  if (lookup.state === "found") return jsonResponse({ ok: true, job: lookup.job }, 200);
+  if (lookup.state === "expired") {
+    return jsonResponse({ ok: false, error: "JOB_EXPIRED", message: "Sync job has expired and been cleaned up." }, 404);
+  }
+  return jsonResponse({ ok: false, error: "JOB_NOT_FOUND" }, 404);
+}
+
 async function packageSync(ctx: ServerContext, request: Request): Promise<Response> {
   const body = await readJsonBody(request);
   const packageIdent = body["packageIdent"];
@@ -455,11 +535,14 @@ async function packageSync(ctx: ServerContext, request: Request): Promise<Respon
   for (const field of GAME_PACKAGE_FIELDS) {
     if (Object.hasOwn(body, field)) gamePackage[field] = body[field];
   }
-  const previous = ctx.catalog.gamePackage;
-  const revisionChanged = previous !== null && previous["currentRevisionId"] !== currentRevisionId;
+  const previous = ctx.catalog.gamePackage?.["currentRevisionId"];
+  const revisionChanged = typeof previous === "number" && previous !== currentRevisionId;
   ctx.catalog.gamePackage = gamePackage;
-  // This server keeps one live revision per project, so a sync promotes no revision overrides.
-  return jsonResponse({ ok: true, gamePackage, revisionChanged, promotedRevisionOverrides: [] }, 200);
+  // Only a changed revision promotes the staged revision; a first sync has no earlier revision to replace.
+  const promotedRevisionOverrides = revisionChanged
+    ? promoteStaged(ctx.catalog, ctx.options.parseYaml)
+    : { endpointCount: 0, collectionCount: 0, promoted: false };
+  return jsonResponse({ ok: true, gamePackage, revisionChanged, promotedRevisionOverrides }, 200);
 }
 
 async function revisionInit(ctx: ServerContext, request: Request, url: URL): Promise<Response> {

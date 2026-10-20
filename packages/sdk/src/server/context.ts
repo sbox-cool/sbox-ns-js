@@ -1,19 +1,30 @@
 import type { IdentityOptions } from "../protocol/identity.js";
 import type { EndpointStorage } from "../storage/types.js";
-import { createCatalog, storageDefinitionOf, valuesOf, type Catalog } from "./catalog.js";
+import { createCatalog, stagedCatalogOf, storageDefinitionOf, valuesOf, type Catalog } from "./catalog.js";
 import { createConfigSource, type ConfigSource } from "./config.js";
 import type { ServerOptions, SessionRevocations, ValuesDocument } from "./options.js";
+import { createSyncJobs, type SyncJobs } from "./sync-jobs.js";
+
+// What a request reads: the catalog and the storage built from it. The live view is the committed catalog; the next
+// view layers the staged revision on top.
+export interface RuntimeView {
+  readonly catalog: Catalog;
+  readonly storage: EndpointStorage;
+}
 
 export interface ServerContext {
   readonly options: ServerOptions;
   readonly config: ConfigSource;
   readonly revocations: SessionRevocations;
   readonly catalog: Catalog;
+  readonly syncJobs: SyncJobs;
   now(): number;
   // Game values: static ServerOptions values merged with the ones the editor pushed.
   values(): ValuesDocument;
   // The storage for the current catalog. Rebuilt whenever the catalog revision changes.
   storage(): EndpointStorage;
+  // The runtime for a publish target. next=false reads the live catalog; next=true reads it with the staged revision applied.
+  view(next: boolean): RuntimeView;
 }
 
 // In-process revocation list. Entries live until their session would have expired anyway. Multi-instance
@@ -33,19 +44,32 @@ function createMemoryRevocations(): SessionRevocations {
 export function createServerContext(options: ServerOptions): ServerContext {
   const catalog = createCatalog();
   const values = (): ValuesDocument => valuesOf(catalog, options.values);
+  const now = options.now ?? (() => Date.now());
   let cached: { readonly revision: number; readonly storage: EndpointStorage } | null = null;
+  let overlay: { readonly revision: number; readonly view: RuntimeView } | null = null;
+  const liveStorage = (): EndpointStorage => {
+    if (cached === null || cached.revision !== catalog.revision) {
+      cached = { revision: catalog.revision, storage: options.storage(storageDefinitionOf(catalog, values())) };
+    }
+    return cached.storage;
+  };
   return {
     options,
     config: createConfigSource(options),
     revocations: options.sessionRevocations ?? createMemoryRevocations(),
     catalog,
-    now: options.now ?? (() => Date.now()),
+    syncJobs: createSyncJobs(now, options.projectId),
+    now,
     values,
-    storage() {
-      if (cached === null || cached.revision !== catalog.revision) {
-        cached = { revision: catalog.revision, storage: options.storage(storageDefinitionOf(catalog, values())) };
+    storage: liveStorage,
+    view(next) {
+      if (!next) return { catalog, storage: liveStorage() };
+      if (overlay === null || overlay.revision !== catalog.revision) {
+        const staged = stagedCatalogOf(catalog, options.parseYaml);
+        const storage = staged === catalog ? liveStorage() : options.storage(storageDefinitionOf(staged, values()));
+        overlay = { revision: catalog.revision, view: { catalog: staged, storage } };
       }
-      return cached.storage;
+      return overlay.view;
     },
   };
 }

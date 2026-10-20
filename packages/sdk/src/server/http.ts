@@ -49,12 +49,18 @@ export function safeEqual(a: string, b: string): boolean {
   return difference === 0;
 }
 
-// Reads a JSON body of any shape. An empty body is undefined.
-export async function readJsonValue(request: Request): Promise<unknown> {
+// Reads a request body as text under the JSON size limit.
+export async function readBodyText(request: Request): Promise<string> {
   const text = await request.text();
   if (text.length > MAX_JSON_BODY_CHARS) {
     throw new ProtocolError(413, "BODY_TOO_LARGE", "The request body is too large.");
   }
+  return text;
+}
+
+// Reads a JSON body of any shape. An empty body is undefined.
+export async function readJsonValue(request: Request): Promise<unknown> {
+  const text = await readBodyText(request);
   if (text.trim().length === 0) return undefined;
   try {
     return JSON.parse(text);
