@@ -33,6 +33,17 @@ const AUTH_OPS: Readonly<Record<string, AuthSessionOp>> = {
   revoke: "revoke",
 };
 
+// v3 families the SDK does not serve yet. They answer 501 so clients never mistake them for a missing route.
+const UNBUILT_FAMILIES: Readonly<Record<string, true>> = {
+  storage: true,
+  queries: true,
+  "game-logs": true,
+  media: true,
+  "server-info": true,
+  manage: true,
+  pages: true,
+};
+
 async function route(ctx: ServerContext, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter((part) => part.length > 0);
@@ -68,6 +79,9 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
   }
   if (family === "sessions" && rest.length === 1 && rest[0] === "refresh" && method === "POST") {
     return handleAuthSession(ctx, request, url, "refresh");
+  }
+  if (family !== undefined && Object.hasOwn(UNBUILT_FAMILIES, family)) {
+    return errorResponse({ status: 501, code: "ROUTE_NOT_IMPLEMENTED", message: "This route family is not implemented by @sbox-ns/sdk yet." });
   }
   return errorResponse({ status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." });
 }
