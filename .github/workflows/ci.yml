@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, issue150-portable-sdk]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+  generator-smoke:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Pack the SDK tarball
+        run: npm pack --workspace packages/sdk --pack-destination "$RUNNER_TEMP/pack"
+      - name: Scaffold a fresh backend
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/backend"
+          node packages/create-sbox-ns-backend/dist/cli.js "$OUT" --project-id proj_ci --port 8787
+          TGZ="$(ls "$RUNNER_TEMP"/pack/*.tgz)"
+          cd "$OUT"
+          node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("package.json", "utf8")); p.dependencies["@sbox-ns/sdk"] = "file:" + process.argv[1]; fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");' "$TGZ"
+          npm install
+          npm test
+      - name: Refuse a non-empty target
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/occupied"
+          mkdir -p "$OUT"
+          echo keep > "$OUT/keep.txt"
+          if node packages/create-sbox-ns-backend/dist/cli.js "$OUT" --project-id proj_ci; then
+            echo "generator wrote into a non-empty directory" >&2
+            exit 1
+          fi
+          test "$(cat "$OUT/keep.txt")" = "keep"

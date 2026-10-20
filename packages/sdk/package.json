@@ -20,6 +20,10 @@
   "files": ["dist", "README.md"],
   "sideEffects": false,
   "exports": {
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
     "./protocol": {
       "types": "./dist/protocol/index.d.ts",
       "default": "./dist/protocol/index.js"
