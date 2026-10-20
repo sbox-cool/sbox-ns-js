@@ -176,7 +176,7 @@ describe("random helpers", () => {
       { id: "b", weight: 3 },
     ];
     for (let i = 0; i < 300; i++) {
-      assert.equal(weightedSelect(items, "weight")?.id, "b");
+      assert.equal(weightedSelect(items, "weight"), items[1]);
     }
   });
 

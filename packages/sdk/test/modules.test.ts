@@ -41,10 +41,12 @@ function serverOptions(): ServerOptions {
 
 function clientFor(options: ServerOptions) {
   const server = createNetworkStorageServer(options);
+  const secretKey = options.secretKey;
+  assert.ok(secretKey, "test server options carry a secret key");
   return createSboxNsClient({
     baseUrl: "http://ns.test",
     projectId: options.projectId,
-    secretKey: options.secretKey,
+    secretKey,
     fetch: (url, init) => server.fetch(new Request(url, init)),
   });
 }
