@@ -371,7 +371,7 @@ export function valuesOf(catalog: Catalog, base: ValuesDocument | undefined): Va
   const tables: Record<string, unknown> = { ...base?.tables };
   for (const [id, item] of catalog.gameValues) {
     if (item["type"] === "table") {
-      tables[id] = { name: item["name"], description: item["description"], columns: item["columns"], rows: item["rows"] };
+      tables[id] = { id, type: "table", name: item["name"], description: item["description"], columns: item["columns"], rows: item["rows"] };
     } else {
       groups[id] = { name: item["name"], description: item["description"], values: item["entries"] };
     }

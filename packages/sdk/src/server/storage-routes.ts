@@ -7,6 +7,7 @@ import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
 import { authorize } from "./endpoints.js";
 import { credentialsOf, pathSegment, readJsonBody, readJsonValue } from "./http.js";
+import { KeyRefusal } from "./auth-failure.js";
 import { handleQuery } from "./query-routes.js";
 import { LEDGER_COLLECTION, ledgerSummaryOf } from "../endpoint/ledger.js";
 
@@ -69,7 +70,7 @@ class StorageRefusal extends Error {
 
 function accessOf(ctx: ServerContext, request: Request, url: URL): Access {
   const access = authorize(ctx, request, url);
-  if (access === null) throw new ProtocolError(401, "UNAUTHORIZED", "Invalid or missing API key.");
+  if (access === null) throw new KeyRefusal();
   return access;
 }
 
@@ -193,8 +194,9 @@ async function readDocument(
   access: Access,
 ): Promise<Response> {
   const definition = declared(ctx, collectionId);
-  // An undeclared collection keeps the plain read path: a stored document is still returned, a miss is 404.
-  if (definition !== undefined) await guardAccess(ctx, request, url, definition, "read", key, access, null);
+  // An undeclared collection has no definition to read against: the reference answers a plain miss (404 Key not found).
+  if (definition === undefined) return keyNotFound();
+  await guardAccess(ctx, request, url, definition, "read", key, access, null);
   const record = await ctx.storage().records.get(collectionId, key);
   if (record === null) return keyNotFound();
   return jsonResponse(record);
@@ -276,8 +278,9 @@ async function probeDocument(
   access: Access,
 ): Promise<Response> {
   const definition = declared(ctx, collectionId);
-  // The existence probe shares the read path: an undeclared collection answers from storage, not a fixed false.
-  if (definition !== undefined) await guardAccess(ctx, request, url, definition, "read", key, access, null);
+  // An undeclared collection cannot hold a readable record here: the probe answers exists:false, as the read answers 404.
+  if (definition === undefined) return jsonResponse({ exists: false, ok: true });
+  await guardAccess(ctx, request, url, definition, "read", key, access, null);
   const record = await ctx.storage().records.get(collectionId, key);
   return jsonResponse({ exists: record !== null, ok: true });
 }

@@ -14,6 +14,7 @@ import { verifyAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
+import { KeyRefusal } from "./auth-failure.js";
 import { targetsNext } from "./publish-target.js";
 import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
@@ -78,9 +79,7 @@ export async function handleEndpoint(
   pathSlug: string | null,
 ): Promise<Response> {
   const access = authorize(ctx, request, url);
-  if (access === null) {
-    return errorResponse({ status: 401, code: "UNAUTHORIZED", message: "The request has no valid project key." });
-  }
+  if (access === null) throw new KeyRefusal();
   const state: CallState = { library: false, requestId: null, responseKey: null };
   try {
     const body = request.method === "GET" ? null : await readJsonBody(request);
@@ -123,11 +122,14 @@ async function runCall(
 ): Promise<Response> {
   const { options } = ctx;
   const envelope = body !== null && isEncryptedBody(body) ? body : null;
-  const slug = resolveSlug(pathSlug, body, envelope !== null);
   const view = ctx.view(targetsNext(request, url));
+  if (pathSlug !== null && resolveEndpoint(ctx, view.catalog, pathSlug) === null) {
+    throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `Endpoint "${pathSlug}" was not found.`);
+  }
+  const slug = resolveSlug(pathSlug, body, envelope !== null);
   const target = resolveEndpoint(ctx, view.catalog, slug);
   if (target === null) {
-    throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `No endpoint named "${slug}".`);
+    throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `Endpoint "${slug}" was not found.`);
   }
   if (target.requiresSecretKey && !hasSecretKey) {
     throw new ProtocolError(

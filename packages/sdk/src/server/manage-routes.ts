@@ -18,6 +18,7 @@ import {
 } from "./catalog.js";
 import type { ServerContext } from "./context.js";
 import { authorize, handleEndpoint } from "./endpoints.js";
+import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
 import { pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
 import { PUBLISH_TARGET_HEADER, decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
 import { parseQuery, type QueryDefinition } from "./query-routes.js";
@@ -66,15 +67,15 @@ interface TestResult {
   result: { status: number; body: unknown };
 }
 
-function noRoute(): ProtocolError {
-  return new ProtocolError(404, "NOT_FOUND", "No manage route matches this path.");
+function noRoute(): UnknownRoute {
+  return new UnknownRoute("This Network Storage route is not recognized.");
 }
 
 function requireSecret(ctx: ServerContext, request: Request): string {
   const secret = ctx.options.secretKey;
   const presented = request.headers.get("x-secret-key") ?? request.headers.get("x-api-key");
   if (secret === null || presented === null || !safeEqual(presented, secret)) {
-    throw new ProtocolError(401, "UNAUTHORIZED", "Invalid or missing API key.");
+    throw new KeyRefusal();
   }
   return secret;
 }
@@ -547,7 +548,7 @@ async function packageSync(ctx: ServerContext, request: Request): Promise<Respon
 
 async function revisionInit(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   if (authorize(ctx, request, url) === null) {
-    throw new ProtocolError(401, "UNAUTHORIZED", "Invalid or missing API key.");
+    throw new KeyRefusal();
   }
   const header = request.headers.get("x-ns-revision-id");
   const body = await readJsonBody(request);

@@ -6,8 +6,9 @@ import { describeError, errorResponse, pathSegment } from "./http.js";
 import { handleQuery } from "./query-routes.js";
 import { handleSecurityConfig, handleValues } from "./public-routes.js";
 import { handleStorage, rateLimitsResponse } from "./storage-routes.js";
-import type { ServerOptions } from "./options.js";
+import { KeyRefusal, keyFailureResponse, UnknownRoute, type KeyFamily } from "./auth-failure.js";
 import { jsonResponse } from "../util/http.js";
+import type { ServerOptions } from "./options.js";
 
 export type { ServerOptions, SessionRevocations, ValuesDocument } from "./options.js";
 
@@ -24,6 +25,8 @@ export function createNetworkStorageServer(options: ServerOptions): NetworkStora
       try {
         return await route(ctx, request);
       } catch (error) {
+        if (error instanceof KeyRefusal) return keyFailureResponse(familyOf(request), request, new URL(request.url));
+        if (error instanceof UnknownRoute) return unknownRouteResponse(error.detail);
         return errorResponse(describeError(error));
       }
     },
@@ -54,7 +57,8 @@ function splitRoute(parts: readonly string[]): SplitRoute | null {
   return null;
 }
 
-const NOT_FOUND = { status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." } as const;
+const ROUTE_NOT_RECOGNIZED = "This Network Storage route is not recognized. All /v3/ and /v1/ traffic is served by ASP.NET Core + Store.";
+const STORAGE_NEEDS_PROJECT = "Network Storage v3 endpoints require a project id.";
 
 // Capabilities this server implements. Add a name only when its behaviour is complete.
 const SERVER_CAPABILITIES = ["library-error-envelope", "management-sync-jobs"] as const;
@@ -67,28 +71,35 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
     return jsonResponse({ capabilities: SERVER_CAPABILITIES, api: { root: "/api", aliases: ["/v3", "/v1"] } });
   }
   const split = splitRoute(parts);
-  if (split === null || split.family === undefined || split.project === undefined) return errorResponse(NOT_FOUND);
+  if (split === null || split.family === undefined) return unknownRouteResponse(ROUTE_NOT_RECOGNIZED);
+  if (split.project === undefined) {
+    return unknownRouteResponse(split.family === "storage" ? STORAGE_NEEDS_PROJECT : ROUTE_NOT_RECOGNIZED);
+  }
   const { family, project, rest } = split;
+  const method = request.method;
 
   // Deploy probe: answers for any project, before the project check.
   if (family === "storage" && project === "deploy-canary" && rest[0] === "ping") {
     return jsonResponse({ ok: true, owner: "@sbox-ns/sdk", probe: "deploy-canary" });
   }
-  if (project !== ctx.options.projectId) {
-    return errorResponse({ status: 404, code: "PROJECT_NOT_FOUND", message: "No project matches this path." });
+  if (family === "security-config" && rest.length === 0 && method === "GET" && project !== ctx.options.projectId) {
+    return securityConfigMissing(project);
   }
-  const method = request.method;
+  if (project !== ctx.options.projectId) {
+    if (family === "pages") return pagesNotFound();
+    throw new KeyRefusal();
+  }
 
   if (family === "security-config" && rest.length === 0 && method === "GET") {
     return handleSecurityConfig(ctx, url);
   }
   if (family === "values" && rest.length === 0 && method === "GET") {
-    return handleValues(ctx, request);
+    return handleValues(ctx, request, url);
   }
   if (family === "endpoints") {
     if (method !== "GET" && method !== "POST") return methodNotAllowed();
     if (rest.length === 0) return handleEndpoint(ctx, request, url, null);
-    if (rest.length === 1) return handleEndpoint(ctx, request, url, rest[0]!);
+    if (rest.length === 1) return handleEndpoint(ctx, request, url, pathSegment(rest[0]!));
   }
   if (family === "auth-sessions" && rest.length === 1 && method === "POST") {
     const op = AUTH_OPS[rest[0]!];
@@ -103,9 +114,53 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
   }
   if (family === "rate-limits" && rest.length === 0 && method === "GET") return rateLimitsResponse(ctx);
   if (family === "manage") return handleManage(ctx, request, url, rest);
-  return errorResponse(NOT_FOUND);
+  if (family === "pages") return pagesNotFound();
+  return unknownRouteResponse(ROUTE_NOT_RECOGNIZED);
 }
 
 function methodNotAllowed(): Response {
   return errorResponse({ status: 405, code: "METHOD_NOT_ALLOWED", message: "This method is not allowed here." });
+}
+
+// Route-level misses use the flat envelope the reference returns for unrecognised paths (ok, error, detail).
+function unknownRouteResponse(detail: string): Response {
+  return jsonResponse({ detail, error: "NOT_FOUND", ok: false }, 404);
+}
+
+// Security config is the one public route with its own missing-project answer: the reference reports the project
+// metadata as missing rather than rejecting a key.
+function securityConfigMissing(projectId: string): Response {
+  return jsonResponse(
+    {
+      error: {
+        code: "SECURITY_CONFIG_NOT_FOUND",
+        message: "Security config is unavailable because the project metadata was not found.",
+      },
+      ok: false,
+      projectId,
+      source: "missing",
+    },
+    404,
+  );
+}
+
+// The pages family answers any page of a project with no published page as "Project not found." (reference corpus
+// 'runtime-pages'). The page content itself is not part of this server.
+function pagesNotFound(): Response {
+  return jsonResponse({ error: { code: "NOT_FOUND", message: "Project not found." } }, 404);
+}
+
+function familyOf(request: Request): KeyFamily {
+  const parts = new URL(request.url).pathname.split("/").filter((part) => part.length > 0);
+  const family = splitRoute(parts)?.family;
+  switch (family) {
+    case "manage":
+    case "storage":
+    case "values":
+    case "queries":
+    case "endpoints":
+      return family;
+    default:
+      return "other";
+  }
 }

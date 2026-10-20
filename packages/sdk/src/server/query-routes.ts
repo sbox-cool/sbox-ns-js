@@ -4,6 +4,7 @@ import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import type { ServerContext } from "./context.js";
 import { authorize } from "./endpoints.js";
+import { KeyRefusal } from "./auth-failure.js";
 
 // Queries are named reads over one collection. The runtime runs them on the server, so collection access rules
 // do not apply; a query marked requiresSecretKey needs the secret.
@@ -71,7 +72,7 @@ export async function handleQuery(
   queryId: string,
 ): Promise<Response> {
   const access = authorize(ctx, request, url);
-  if (access === null) throw new ProtocolError(401, "UNAUTHORIZED", "Invalid or missing API key.");
+  if (access === null) throw new KeyRefusal();
   const query = ctx.catalog.queries.get(queryId);
   if (query === undefined) {
     return jsonResponse({ error: { code: "NOT_FOUND", message: "Query not found." } }, 404);
