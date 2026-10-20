@@ -89,6 +89,21 @@ test("an unrecognised top-level field is a warning and blocks the automatic writ
   assert.deepEqual(codesOf(outcome), ["SOURCE_UPGRADE_AMBIGUOUS_FIELD"]);
 });
 
+test("an out-of-range maxRecords is an error that blocks the automatic write", () => {
+  const text = ["sourceVersion: 1", "kind: collection", "id: profile", "name: Profile", "collectionType: per-steamid", "accessMode: public", "maxRecords: 60", ""].join("\n");
+  const outcome = upgradeSource({ kind: "collection", id: "profile", sourceText: text }, tools);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.body["safeAutoWrite"], false);
+  assert.ok(codesOf(outcome).includes("INVALID_MAX_RECORDS"));
+});
+
+test("rateLimits mode none is refused by source upgrade", () => {
+  const text = ["sourceVersion: 1", "kind: collection", "id: profile", "name: Profile", "rateLimits:", "  mode: none", ""].join("\n");
+  const outcome = upgradeSource({ kind: "collection", id: "profile", sourceText: text }, tools);
+  assert.equal(outcome.body["safeAutoWrite"], false);
+  assert.ok(codesOf(outcome).includes("INVALID_RATE_LIMITS"));
+});
+
 test("an unsupported kind fails the upgrade at /kind", () => {
   const outcome = upgradeSource({ kind: "sprite", id: "x" }, tools);
   assert.equal(outcome.ok, false);

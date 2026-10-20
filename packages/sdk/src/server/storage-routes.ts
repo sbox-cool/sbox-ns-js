@@ -53,6 +53,20 @@ export function takeAppendQuota(counts: Map<string, number>, nowMs: number, coll
 
 const STEAM_ID = /^\d{17}$/;
 
+// A refusal in the envelope the direct collection routes use (reference StorageApiEndpoints), not the library envelope.
+// handleStorage turns it into the response.
+class StorageRefusal extends Error {
+  readonly status: number;
+  readonly body: Readonly<Record<string, unknown>>;
+
+  constructor(status: number, body: Readonly<Record<string, unknown>>) {
+    super("The collection request was refused.");
+    this.name = "StorageRefusal";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 function accessOf(ctx: ServerContext, request: Request, url: URL): Access {
   const access = authorize(ctx, request, url);
   if (access === null) throw new ProtocolError(401, "UNAUTHORIZED", "Invalid or missing API key.");
@@ -65,7 +79,7 @@ function declared(ctx: ServerContext, collectionId: string): CollectionDefinitio
 
 function requireDeclared(ctx: ServerContext, collectionId: string): CollectionDefinition {
   const definition = declared(ctx, collectionId);
-  if (definition === undefined) throw new ProtocolError(404, "NOT_FOUND", "Collection not found.");
+  if (definition === undefined) throw new StorageRefusal(404, { error: "NOT_FOUND", detail: "Collection not found." });
   return definition;
 }
 
@@ -85,8 +99,9 @@ async function playerOf(
   return identity.steamId;
 }
 
-// The direct-access rules, in order: a secret key bypasses them; the collection must be public; deletes need
-// allowRecordDelete; non-global collections accept writes only for the caller's own steam id.
+// The direct-access rules, in order (reference AuthorizePublicDocumentAccessAsync): a secret key bypasses them; the
+// collection must be public; deletes need allowRecordDelete; with s&box auth the caller is verified on every access,
+// and non-global writes and deletes accept only the verified steam id or its save slots ("{steamId}_x").
 async function guardAccess(
   ctx: ServerContext,
   request: Request,
@@ -100,18 +115,35 @@ async function guardAccess(
   if (access.hasSecretKey) return;
   const mode = String(definition.accessMode ?? "endpoint").toLowerCase();
   if (mode !== "public") {
-    throw new ProtocolError(403, "ENDPOINT_ONLY", "This collection can only be accessed through endpoints.");
+    throw new StorageRefusal(403, { ok: false, error: "ENDPOINT_ONLY", message: "This collection can only be accessed through endpoints." });
   }
   if (op === "delete" && definition.allowRecordDelete !== true) {
-    throw new ProtocolError(403, "RECORD_DELETE_DISABLED", "Record deletion is not enabled for this collection.");
+    throw new StorageRefusal(403, { ok: false, error: "RECORD_DELETE_DISABLED", message: "Record deletion is not enabled for this collection." });
   }
   // Auth-disabled projects keep the unverified client identity and skip the ownership gate.
   if (ctx.options.requireSboxAuth !== true) return;
-  if (op === "read" || definition.collectionType === "global") return;
-  const steamId = await playerOf(ctx, request, url, body);
-  if (key !== steamId && !key.startsWith(`${steamId}_`)) {
-    throw new ProtocolError(403, "FORBIDDEN", "Players can only modify their own documents.");
+  let steamId: string;
+  try {
+    steamId = await playerOf(ctx, request, url, body);
+  } catch (error) {
+    if (error instanceof ProtocolError) {
+      throw new StorageRefusal(error.status, { ok: false, error: error.code, message: error.message });
+    }
+    throw error;
   }
+  if (op === "read" || definition.collectionType === "global") return;
+  if (!isOwnDocumentKey(key, steamId)) {
+    throw new StorageRefusal(403, {
+      ok: false,
+      error: "FORBIDDEN",
+      message: "Players can only modify their own documents: the key must be the verified Steam ID or start with '{steamId}_'.",
+    });
+  }
+}
+
+// A per-player document belongs to the player when keyed by their Steam ID or a save slot of it (reference IsOwnDocumentKey).
+function isOwnDocumentKey(key: string, steamId: string): boolean {
+  return key === steamId || (key.length > steamId.length + 1 && key.startsWith(`${steamId}_`));
 }
 
 function keyNotFound(): Response {
@@ -161,8 +193,8 @@ async function readDocument(
   access: Access,
 ): Promise<Response> {
   const definition = declared(ctx, collectionId);
-  if (definition === undefined) return keyNotFound();
-  await guardAccess(ctx, request, url, definition, "read", key, access, null);
+  // An undeclared collection keeps the plain read path: a stored document is still returned, a miss is 404.
+  if (definition !== undefined) await guardAccess(ctx, request, url, definition, "read", key, access, null);
   const record = await ctx.storage().records.get(collectionId, key);
   if (record === null) return keyNotFound();
   return jsonResponse(record);
@@ -179,14 +211,17 @@ async function readLedger(
   access: Access,
 ): Promise<Response> {
   const definition = declared(ctx, collectionId);
-  if (definition === undefined) return keyNotFound();
-  await guardAccess(ctx, request, url, definition, "read", steamId, access, null);
+  if (definition !== undefined) await guardAccess(ctx, request, url, definition, "read", steamId, access, null);
   const storage = ctx.storage();
   const entries = (await storage.records.list(LEDGER_COLLECTION))
     .map((row) => row.data)
     .filter((row) => row["collection_id"] === collectionId && row["steam_id"] === steamId)
     .sort((a, b) => String(a["ts"]).localeCompare(String(b["ts"])));
-  if (entries.length === 0 && (await storage.records.get(collectionId, steamId)) === null) return keyNotFound();
+  // Reference rule: a missing key has no ledger rows, no record, and no player profile. The stats row stands in for the profile.
+  if (entries.length === 0) {
+    const record = definition === undefined ? null : await storage.records.get(collectionId, steamId);
+    if (record === null && (await storage.records.get("_stats", steamId)) === null) return keyNotFound();
+  }
   return jsonResponse({
     steamId,
     field: "all",
@@ -241,8 +276,8 @@ async function probeDocument(
   access: Access,
 ): Promise<Response> {
   const definition = declared(ctx, collectionId);
-  if (definition === undefined) return jsonResponse({ exists: false, ok: true });
-  await guardAccess(ctx, request, url, definition, "read", key, access, null);
+  // The existence probe shares the read path: an undeclared collection answers from storage, not a fixed false.
+  if (definition !== undefined) await guardAccess(ctx, request, url, definition, "read", key, access, null);
   const record = await ctx.storage().records.get(collectionId, key);
   return jsonResponse({ exists: record !== null, ok: true });
 }
@@ -314,13 +349,13 @@ async function listSaves(
   access: Access,
 ): Promise<Response> {
   const definition = requireDeclared(ctx, collectionId);
-  await guardAccess(ctx, request, url, definition, "write", `${steamId}_`, access, null);
+  await guardAccess(ctx, request, url, definition, "read", `${steamId}_`, access, null);
   const prefix = `${steamId}_`;
   const stored = await ctx.storage().records.list(collectionId);
   const records = stored
     .filter((record) => record.key.startsWith(prefix))
     .map((record) => ({ id: record.key.slice(prefix.length), recordName: record.data["recordName"], data: record.data["data"] }));
-  return jsonResponse({ ok: true, maxRecords: definition.maxRecords ?? null, records });
+  return jsonResponse({ ok: true, maxRecords: Math.max(1, definition.maxRecords ?? 0), records });
 }
 
 async function createSave(
@@ -469,6 +504,21 @@ export function rateLimitsResponse(ctx: ServerContext): Response {
 // Entry point for everything under /storage/{project}/... after the project check. `rest` excludes the project.
 // `family` is the URL family (v1, v3, or api). The api alias serves queries and saves; leaderboard list is v1/v3 only.
 export async function handleStorage(
+  ctx: ServerContext,
+  request: Request,
+  url: URL,
+  rest: readonly string[],
+  family: string,
+): Promise<Response> {
+  try {
+    return await dispatchStorage(ctx, request, url, rest, family);
+  } catch (error) {
+    if (error instanceof StorageRefusal) return jsonResponse(error.body, error.status);
+    throw error;
+  }
+}
+
+async function dispatchStorage(
   ctx: ServerContext,
   request: Request,
   url: URL,

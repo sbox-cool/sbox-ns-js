@@ -104,42 +104,42 @@ export async function planApply(
 
   const counts = new Map<string, { collection: string; playerKey: string; before: number; added: number; max: number }>();
   const ops: PlannedOp[] = [];
+  // The per-player count moves by the net effect of the whole batch: a delete earlier in the batch frees the slot a later create uses.
+  const adjustCount = async (rule: CollectionRule, key: string, delta: number): Promise<void> => {
+    const playerKey = playerKeyOf(key);
+    const id = targetOf(rule.id, playerKey);
+    let entry = counts.get(id);
+    if (!entry) {
+      entry = { collection: rule.id, playerKey, before: await reader.countLive(rule.id, playerKey), added: 0, max: rule.maxRecords };
+      counts.set(id, entry);
+    }
+    entry.added += delta;
+  };
   for (const { write, rule } of planned) {
     const current = observed.get(targetOf(rule.id, write.key));
     if (current === undefined) {
       throw new StorageError("INVALID_BATCH", `Record ${rule.id}/${write.key} was not observed before planning.`);
     }
-
     if (write.op === "delete") {
       if (!current.live) continue;
       if (rule.global) {
         ops.push({ kind: "remove", collection: rule.id, key: write.key });
       } else {
+        await adjustCount(rule, write.key, -1);
         ops.push({ kind: "upsert", collection: rule.id, key: write.key, data: null, version: current.version + 1 });
       }
       continue;
     }
-
-    if (!rule.global && !current.live) {
-      const playerKey = playerKeyOf(write.key);
-      const id = targetOf(rule.id, playerKey);
-      let entry = counts.get(id);
-      if (!entry) {
-        const before = await reader.countLive(rule.id, playerKey);
-        entry = { collection: rule.id, playerKey, before, added: 0, max: rule.maxRecords };
-        counts.set(id, entry);
-      }
-      if (entry.before + entry.added >= entry.max) {
-        throw new StorageError("RECORD_LIMIT_REACHED", `Maximum ${entry.max} record(s) per player in "${rule.id}".`);
-      }
-      entry.added += 1;
-    }
+    if (!rule.global && !current.live) await adjustCount(rule, write.key, 1);
     ops.push({ kind: "upsert", collection: rule.id, key: write.key, data: write.data, version: current.version + 1 });
   }
-
-  const limits = [...counts.values()]
-    .filter((entry) => entry.added > 0)
-    .map((entry) => ({ collection: entry.collection, playerKey: entry.playerKey, count: entry.before }));
+  // Only the final live count per player must fit the limit; the order of writes inside the batch does not matter.
+  for (const entry of counts.values()) {
+    if (entry.before + entry.added > entry.max) {
+      throw new StorageError("RECORD_LIMIT_REACHED", `Maximum ${entry.max} record(s) per player in "${entry.collection}".`);
+    }
+  }
+  const limits = [...counts.values()].map((entry) => ({ collection: entry.collection, playerKey: entry.playerKey, count: entry.before }));
 
   return { checks: [...checks.values()], limits, ops };
 }

@@ -236,8 +236,69 @@ function validateCanonical(kind: SourceKind, canonical: Record<string, unknown>,
     }
     return [];
   }
+  const findings = kind === "collection" ? collectionDiagnostics(canonical) : [];
+  if (findings.some((item) => item.severity === "error")) return findings;
   const fault = definitionFault(storeKindOf(kind), canonical, parseYaml);
-  return fault === null ? [] : [diagnostic("SOURCE_DEFINITION_INVALID", fault.message, fault.path)];
+  return fault === null ? findings : [...findings, diagnostic("SOURCE_DEFINITION_INVALID", fault.message, fault.path)];
+}
+
+const COLLECTION_TYPES: readonly string[] = ["per-steamid", "global", "player"];
+const COLLECTION_ACCESS_MODES: readonly string[] = ["public", "endpoint", "private"];
+
+function isIntegerIn(value: unknown, low: number, high: number): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value >= low && value <= high;
+}
+
+// The top-level collection checks of the reference schema validator (NetworkStorageSchemaValidator.ValidateCollection).
+// The schema walk is covered by definitionFault. Warnings do not block the upgrade; errors are reported and refuse it.
+function collectionDiagnostics(canonical: Record<string, unknown>): UpgradeDiagnostic[] {
+  const findings: UpgradeDiagnostic[] = [];
+  const collectionType = canonical["collectionType"];
+  if (collectionType !== undefined && (typeof collectionType !== "string" || !COLLECTION_TYPES.includes(collectionType))) {
+    findings.push({
+      severity: "warning",
+      code: "COLLECTION_TYPE",
+      message: "collectionType should be per-steamid (one record per player) or global (shared records). Anything else is stored per player.",
+      sourcePath: "/collectionType",
+    });
+  }
+  const accessMode = canonical["accessMode"];
+  if (typeof accessMode === "string" && !COLLECTION_ACCESS_MODES.includes(accessMode)) {
+    findings.push({
+      severity: "warning",
+      code: "ACCESS_MODE",
+      message: "accessMode should be public (game clients write records directly) or endpoint (only endpoints write).",
+      sourcePath: "/accessMode",
+    });
+  }
+  if (canonical["maxRecords"] !== undefined && !isIntegerIn(canonical["maxRecords"], 1, 50)) {
+    findings.push(diagnostic("INVALID_MAX_RECORDS", "maxRecords must be a whole number from 1 to 50 (save slots per player).", "/maxRecords"));
+  }
+  for (const flag of ["allowRecordDelete", "requireSaveVersion", "webhookOnRateLimit"]) {
+    if (canonical[flag] !== undefined && typeof canonical[flag] !== "boolean") {
+      findings.push(diagnostic("INVALID_FLAG", `${flag} must be true or false.`, `/${flag}`));
+    }
+  }
+  const action = canonical["rateLimitAction"];
+  if (typeof action === "string" && action !== "reject" && action !== "clamp") {
+    findings.push(diagnostic("INVALID_RATE_LIMIT_ACTION", "rateLimitAction must be reject or clamp.", "/rateLimitAction"));
+  }
+  const rateLimits = canonical["rateLimits"];
+  if (rateLimits !== undefined) {
+    if (typeof rateLimits !== "object" || rateLimits === null || Array.isArray(rateLimits)) {
+      findings.push(diagnostic("INVALID_RATE_LIMITS", "rateLimits must be an object with mode and savesPerDay.", "/rateLimits"));
+    } else {
+      const limits = rateLimits as Record<string, unknown>;
+      const mode = limits["mode"];
+      if (typeof mode === "string" && mode !== "player" && mode !== "collection") {
+        findings.push(diagnostic("INVALID_RATE_LIMITS", "rateLimits.mode must be player or collection.", "/rateLimits/mode"));
+      }
+      if (limits["savesPerDay"] !== undefined && !isIntegerIn(limits["savesPerDay"], 1, 10_000_000)) {
+        findings.push(diagnostic("INVALID_RATE_LIMITS", "rateLimits.savesPerDay must be a whole number from 1 to 10000000.", "/rateLimits/savesPerDay"));
+      }
+    }
+  }
+  return findings;
 }
 
 function storeKindOf(kind: "endpoint" | "workflow" | "collection"): ResourceKind {

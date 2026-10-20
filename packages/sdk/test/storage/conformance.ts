@@ -124,6 +124,26 @@ export function runConformance(fixture: ConformanceFixture): void {
       assert.equal((await storage.records.list("saves")).length, 3);
     });
 
+    it("judges maxRecords on the whole batch: a delete and a create in one batch fit", async () => {
+      const storage = await open(freshStore());
+      for (const slot of ["1", "2", "3"]) await putRecord(storage, "saves", `${PLAYER_A}_${slot}`, { slot });
+      const observed = (await storage.records.getVersioned("saves", `${PLAYER_A}_2`)).version;
+      await storage.apply(
+        [
+          { collection: "saves", key: `${PLAYER_A}_2`, op: "delete" },
+          { collection: "saves", key: `${PLAYER_A}_4`, op: "put", data: { slot: "4" } },
+        ],
+        {
+          expectedVersions: [
+            { collection: "saves", key: `${PLAYER_A}_2`, version: observed },
+            { collection: "saves", key: `${PLAYER_A}_4`, version: 0 },
+          ],
+        },
+      );
+      assert.equal((await storage.records.list("saves")).length, 3);
+      await assertRejects(putCreate(storage, "saves", `${PLAYER_A}_5`, { slot: "5" }), "RECORD_LIMIT_REACHED");
+    });
+
     it("rejects a payload that violates the collection schema", async () => {
       const storage = await open(freshStore());
       await assertRejects(putCreate(storage, "profile", PLAYER_A, { score: "high" }), "SCHEMA_VIOLATION");
