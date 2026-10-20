@@ -1,10 +1,10 @@
 import type { FetchPolicy } from "../endpoint/fetch.js";
 import type { SecretStore } from "../endpoint/runtime.js";
-import type { EndpointDefinition, EndpointGlobal, WorkflowFunction } from "../endpoint/types.js";
+import type { EndpointGlobal, EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
 import type { SecuritySettings } from "../protocol/config.js";
 import type { RequestKeyRing } from "../protocol/crypto.js";
 import type { ReplayStore } from "../protocol/replay.js";
-import type { EndpointStorage } from "../storage/types.js";
+import type { CollectionDefinition, EndpointStorage } from "../storage/types.js";
 
 // Records logouts. Auth session tokens are stateless and expire on their own; revocation needs a shared
 // store to be enforced across processes. The SDK ships an in-process store and never claims cross-instance
@@ -36,14 +36,25 @@ export interface ServerOptions {
   // HMAC secret for auth session tokens. Null means auth sessions are unavailable.
   sessionSecret: string | null;
   sessionRevocations?: SessionRevocations;
-  endpoints: Readonly<Record<string, EndpointDefinition>>;
+  endpoints: Readonly<Record<string, EndpointHandler>>;
   workflows?: Readonly<Record<string, WorkflowFunction>>;
   globals?: Readonly<Record<string, Readonly<Record<string, EndpointGlobal>>>>;
   secrets?: SecretStore;
   values?: ValuesDocument;
-  storage: EndpointStorage;
+  // Builds the storage for the current collection and value definitions. The server calls it again whenever
+  // management sync changes either, so the factory must reopen the same backing store each time.
+  storage: StorageFactory;
+  // Parses YAML source documents uploaded through management sync. Without one, YAML sources are rejected.
+  parseYaml?: (text: string) => unknown;
   fetchPolicy: FetchPolicy;
   replayStore: ReplayStore;
   now?: () => number;
   log?: (value: unknown) => void;
 }
+
+export interface StorageDefinition {
+  collections: readonly CollectionDefinition[];
+  values: Record<string, unknown>;
+}
+
+export type StorageFactory = (definition: StorageDefinition) => EndpointStorage;

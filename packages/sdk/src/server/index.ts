@@ -1,9 +1,13 @@
 import { handleAuthSession, type AuthSessionOp } from "./auth-routes.js";
+import { handleManage } from "./manage-routes.js";
 import { createServerContext, type ServerContext } from "./context.js";
 import { handleEndpoint } from "./endpoints.js";
-import { describeError, errorResponse } from "./http.js";
+import { describeError, errorResponse, pathSegment } from "./http.js";
+import { handleQuery } from "./query-routes.js";
 import { handleSecurityConfig, handleValues } from "./public-routes.js";
+import { handleStorage, rateLimitsResponse } from "./storage-routes.js";
 import type { ServerOptions } from "./options.js";
+import { jsonResponse } from "../util/http.js";
 
 export type { ServerOptions, SessionRevocations, ValuesDocument } from "./options.js";
 
@@ -33,34 +37,40 @@ const AUTH_OPS: Readonly<Record<string, AuthSessionOp>> = {
   revoke: "revoke",
 };
 
-// v3 families the SDK does not serve yet. They answer 501 so clients never mistake them for a missing route.
-const UNBUILT_FAMILIES: Readonly<Record<string, true>> = {
-  storage: true,
-  queries: true,
-  "game-logs": true,
-  media: true,
-  "server-info": true,
-  manage: true,
-  pages: true,
-};
+interface SplitRoute {
+  readonly family: string | undefined;
+  readonly project: string | undefined;
+  readonly rest: readonly string[];
+}
+
+// /v1/{family}/{project}/..., /v3/{family}/{project}/..., and /api/{family}/{project}/... share one shape.
+// /pages/{project}/... is the pages alias.
+function splitRoute(parts: readonly string[]): SplitRoute | null {
+  const first = parts[0];
+  if (first === "v1" || first === "v3" || first === "api") {
+    return { family: parts[1], project: parts[2], rest: parts.slice(3) };
+  }
+  if (first === "pages") return { family: "pages", project: parts[1], rest: parts.slice(2) };
+  return null;
+}
+
+const NOT_FOUND = { status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." } as const;
 
 async function route(ctx: ServerContext, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter((part) => part.length > 0);
-  const version = parts[0];
-  if (version !== "v1" && version !== "v3") {
-    return errorResponse({ status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." });
-  }
-  const family = parts[1];
-  const project = parts[2];
-  if (project === undefined) {
-    return errorResponse({ status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." });
+  const split = splitRoute(parts);
+  if (split === null || split.family === undefined || split.project === undefined) return errorResponse(NOT_FOUND);
+  const { family, project, rest } = split;
+
+  // Deploy probe: answers for any project, before the project check.
+  if (family === "storage" && project === "deploy-canary" && rest[0] === "ping") {
+    return jsonResponse({ ok: true, owner: "@sbox-ns/sdk", probe: "deploy-canary" });
   }
   if (project !== ctx.options.projectId) {
     return errorResponse({ status: 404, code: "PROJECT_NOT_FOUND", message: "No project matches this path." });
   }
   const method = request.method;
-  const rest = parts.slice(3);
 
   if (family === "security-config" && rest.length === 0 && method === "GET") {
     return handleSecurityConfig(ctx, url);
@@ -80,10 +90,13 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
   if (family === "sessions" && rest.length === 1 && rest[0] === "refresh" && method === "POST") {
     return handleAuthSession(ctx, request, url, "refresh");
   }
-  if (family !== undefined && Object.hasOwn(UNBUILT_FAMILIES, family)) {
-    return errorResponse({ status: 501, code: "ROUTE_NOT_IMPLEMENTED", message: "This route family is not implemented by @sbox-ns/sdk yet." });
+  if (family === "storage") return handleStorage(ctx, request, url, rest, family);
+  if (family === "queries" && rest.length === 1 && rest[0] !== undefined && method === "GET") {
+    return handleQuery(ctx, request, url, pathSegment(rest[0]));
   }
-  return errorResponse({ status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." });
+  if (family === "rate-limits" && rest.length === 0 && method === "GET") return rateLimitsResponse(ctx);
+  if (family === "manage") return handleManage(ctx, request, url, rest);
+  return errorResponse(NOT_FOUND);
 }
 
 function methodNotAllowed(): Response {

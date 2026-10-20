@@ -10,7 +10,7 @@ import {
   refuseHost,
   sendFetch,
 } from "./fetch.js";
-import type { EndpointDefinition, EndpointGlobal, EndpointRequest, FetchOptions, FetchResponse, Ns, WorkflowFunction } from "./types.js";
+import type { EndpointGlobal, EndpointHandler, EndpointRequest, FetchOptions, FetchResponse, Ns, WorkflowFunction } from "./types.js";
 
 // Thrown by ns.fail(). The backend maps it to a status and an error body.
 export class ScriptFailure extends Error {
@@ -57,17 +57,18 @@ export interface RunOutcome {
   expectedVersions: ExpectedVersion[];
 }
 
-// Upper bound on rounds that load missing state. Each round loads at least one value the handler reads for the first
-// time, so the bound is the depth of dependent reads, not the number of keys read.
-const STATE_LOAD_ROUNDS = 32;
+// Caps for one run. A state round loads what the last pass read for the first time, so the round count is the depth of
+// dependent reads. A round loads at most MAX_LOADS_PER_ROUND keys.
+const MAX_STATE_ROUNDS = 8;
+const MAX_LOADS_PER_ROUND = 64;
 
 // Handlers read state synchronously, as server scripts do. A read the run has not loaded yet returns null and records
-// a need. A pass that recorded a need is discarded; the needs are loaded from storage and the handler runs again.
-// Outbound requests work the same way: a pass that started one is discarded and the request is sent before the rerun.
-// Writes are staged per pass and committed only when a pass completes with no needs and no pending requests.
-// Logs from discarded passes are dropped.
+// a need. A pass that recorded a need is discarded: the needs are loaded from storage and the handler runs again.
+// Outbound requests are sent only from a pass whose state is complete. That pass is discarded, the requests are sent,
+// and the handler runs again with the responses. Writes are staged per pass and committed only when a pass completes
+// with no needs and no pending requests. Logs from discarded passes are dropped.
 export async function runEndpoint(
-  definition: EndpointDefinition,
+  handler: EndpointHandler,
   request: EndpointRequest,
   env: RunEnvironment,
 ): Promise<RunOutcome> {
@@ -80,7 +81,7 @@ export async function runEndpoint(
     let value: unknown;
     let failure: { error: unknown } | null = null;
     try {
-      value = definition.handle(request, pass.ns, { globals: env.globals });
+      value = handler(request, pass.ns, { globals: env.globals });
       if (isThenable(value)) {
         // The rejection is observed here, so it cannot surface as an unhandled promise rejection.
         Promise.resolve(value).catch(() => undefined);
@@ -90,28 +91,37 @@ export async function runEndpoint(
       failure = { error };
     }
     throwIfCancelled(env.signal);
-    if (pass.needs.size === 0 && pass.pending.size === 0) {
-      if (failure !== null) throw failure.error;
-      for (const entry of pass.logs) env.log(entry);
-      return { value, writes: pass.writes.stagedWrites(), expectedVersions: pass.writes.expectedVersions() };
-    }
     if (pass.needs.size > 0) {
       stateRounds += 1;
-      if (stateRounds > STATE_LOAD_ROUNDS) {
+      if (stateRounds > MAX_STATE_ROUNDS) {
         throw new ScriptFailure(
-          "STATE_LOAD_LIMIT_EXCEEDED",
-          `The endpoint run read dependent state more than ${STATE_LOAD_ROUNDS} times.`,
+          "STATE_ROUNDS_EXCEEDED",
+          `The endpoint run read dependent state in more than ${MAX_STATE_ROUNDS} rounds.`,
+          500,
+        );
+      }
+      if (pass.needs.size > MAX_LOADS_PER_ROUND) {
+        throw new ScriptFailure(
+          "STATE_LOADS_EXCEEDED",
+          `The endpoint run loaded more than ${MAX_LOADS_PER_ROUND} state keys in one round.`,
           500,
         );
       }
       await Promise.all([...pass.needs.values()].map((load) => load()));
+      continue;
     }
-    const sent = await Promise.all(
-      [...pass.pending.entries()].map(
-        async ([key, call]) => [key, await sendFetch(call, env.fetchPolicy, env.signal)] as const,
-      ),
-    );
-    for (const [key, outcome] of sent) completed.set(key, outcome);
+    if (pass.pending.size > 0) {
+      const sent = await Promise.all(
+        [...pass.pending.entries()].map(
+          async ([key, call]) => [key, await sendFetch(call, env.fetchPolicy, env.signal)] as const,
+        ),
+      );
+      for (const [key, outcome] of sent) completed.set(key, outcome);
+      continue;
+    }
+    if (failure !== null) throw failure.error;
+    for (const entry of pass.logs) env.log(entry);
+    return { value, writes: pass.writes.stagedWrites(), expectedVersions: pass.writes.expectedVersions() };
   }
 }
 

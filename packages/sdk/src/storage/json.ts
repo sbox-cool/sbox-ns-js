@@ -15,7 +15,7 @@ export function normalizeRecordData(value: unknown): Record<string, unknown> {
   if (!isPlainObject(value)) {
     throw new StorageError("INVALID_RECORD", "Record payload must be a JSON object.");
   }
-  const copy = cloneJson(value, 0, new Set()) as Record<string, unknown>;
+  const copy = cloneJson(value) as Record<string, unknown>;
   const text = JSON.stringify(copy);
   if (new TextEncoder().encode(text).length > MAX_PAYLOAD_BYTES) {
     throw new StorageError("RECORD_TOO_LARGE", `Record payload exceeds ${MAX_PAYLOAD_BYTES} bytes.`);
@@ -23,9 +23,10 @@ export function normalizeRecordData(value: unknown): Record<string, unknown> {
   return copy;
 }
 
-function cloneJson(value: unknown, depth: number, seen: Set<object>): unknown {
+// Detached JSON copy of any JSON-compatible value. Throws INVALID_RECORD for non-JSON input.
+export function cloneJson(value: unknown, depth = 0, seen: Set<object> = new Set()): unknown {
   if (depth > MAX_DEPTH) {
-    throw new StorageError("INVALID_RECORD", `Record payload nests deeper than ${MAX_DEPTH} levels.`);
+    throw new StorageError("INVALID_RECORD", `Payload nests deeper than ${MAX_DEPTH} levels.`);
   }
   if (value === null) return null;
   switch (typeof value) {
@@ -34,23 +35,23 @@ function cloneJson(value: unknown, depth: number, seen: Set<object>): unknown {
       return value;
     case "number":
       if (!Number.isFinite(value)) {
-        throw new StorageError("INVALID_RECORD", "Record payload numbers must be finite.");
+        throw new StorageError("INVALID_RECORD", "Payload numbers must be finite.");
       }
       return value;
     case "object":
       break;
     default:
-      throw new StorageError("INVALID_RECORD", `Record payload contains a ${typeof value} value, which is not JSON.`);
+      throw new StorageError("INVALID_RECORD", `Payload contains a ${typeof value} value, which is not JSON.`);
   }
   if (seen.has(value as object)) {
-    throw new StorageError("INVALID_RECORD", "Record payload contains a cycle.");
+    throw new StorageError("INVALID_RECORD", "Payload contains a cycle.");
   }
   seen.add(value as object);
   let out: unknown;
   if (Array.isArray(value)) {
     out = value.map((item, index) => {
       if (!(index in value)) {
-        throw new StorageError("INVALID_RECORD", "Record payload arrays must not be sparse.");
+        throw new StorageError("INVALID_RECORD", "Payload arrays must not be sparse.");
       }
       return cloneJson(item, depth + 1, seen);
     });
@@ -61,7 +62,7 @@ function cloneJson(value: unknown, depth: number, seen: Set<object>): unknown {
     }
     out = obj;
   } else {
-    throw new StorageError("INVALID_RECORD", "Record payload contains a non-plain object.");
+    throw new StorageError("INVALID_RECORD", "Payload contains a non-plain object.");
   }
   seen.delete(value as object);
   return out;

@@ -1,67 +1,74 @@
-import { isRecord } from "../util/guards.js";
-import type { EndpointStorage, RecordData, RecordWrite, StoredRecord } from "./types.js";
+import { createEndpointStorage, type EndpointStorageOptions, type StorageEngine } from "./engine.js";
+import { playerKeyOf } from "./keys.js";
+import type { PlanReader, PlannedOp } from "./planner.js";
+import type { EndpointStorage, RecordData, StoredRecord, VersionedRecord } from "./types.js";
 
-export interface MemoryStorageSeed {
-  records?: Record<string, Record<string, RecordData>>;
-  values?: Record<string, unknown>;
+export type MemoryStorageOptions = EndpointStorageOptions;
+
+interface Row {
+  collection: string;
+  key: string;
+  // JSON text of the payload, or null for a tombstone. Text keeps reads detached from stored state.
+  json: string | null;
+  version: number;
 }
 
-// Single-process only. State lives in this instance, not in module globals. Use a database adapter
-// for multiple instances or restarts.
-export function createMemoryStorage(seed: MemoryStorageSeed = {}): EndpointStorage {
-  const collections = new Map<string, Map<string, RecordData>>();
-  for (const [collection, rows] of Object.entries(seed.records ?? {})) {
-    const map = new Map<string, RecordData>();
-    for (const [key, data] of Object.entries(rows)) map.set(key, cloneRecord(data));
-    collections.set(collection, map);
-  }
-  const values = seed.values ?? {};
-
-  return {
-    records: {
-      async get(collection, key) {
-        const data = collections.get(collection)?.get(key);
-        return data === undefined ? null : cloneRecord(data);
-      },
-      async list(collection) {
-        const rows: StoredRecord[] = [];
-        for (const [key, data] of collections.get(collection) ?? []) {
-          rows.push({ key, data: cloneRecord(data) });
-        }
-        return rows;
-      },
+// Non-durable provider for tests, local development, and single-process runs. apply() is serialized by
+// the engine lock, and the plan is committed synchronously after it is computed.
+export function createMemoryStorage(options: MemoryStorageOptions): EndpointStorage {
+  const rows = new Map<string, Row>();
+  const engine: StorageEngine = {
+    async setup() {},
+    async readVersioned(collection, key): Promise<VersionedRecord> {
+      const row = rows.get(targetOf(collection, key));
+      if (row === undefined) return { data: null, version: 0 };
+      return { data: row.json === null ? null : (JSON.parse(row.json) as RecordData), version: row.version };
     },
-    values: {
-      async get(path) {
-        const [group, key] = path.split(".", 2);
-        if (group === undefined || group === "") return null;
-        const groupValue = Object.hasOwn(values, group) ? values[group] : undefined;
-        if (key === undefined) return groupValue === undefined ? null : clone(groupValue);
-        if (!isRecord(groupValue) || !Object.hasOwn(groupValue, key)) return null;
-        return clone(groupValue[key]);
-      },
-    },
-    async apply(writes: readonly RecordWrite[]) {
-      for (const write of writes) {
-        if (write.op === "delete") {
-          collections.get(write.collection)?.delete(write.key);
-          continue;
-        }
-        let map = collections.get(write.collection);
-        if (map === undefined) {
-          map = new Map();
-          collections.set(write.collection, map);
-        }
-        map.set(write.key, cloneRecord(write.data));
+    async list(collection): Promise<StoredRecord[]> {
+      const out: StoredRecord[] = [];
+      for (const row of rows.values()) {
+        if (row.collection !== collection || row.json === null) continue;
+        out.push({ key: row.key, data: JSON.parse(row.json) as RecordData, version: row.version });
       }
+      return out;
+    },
+    async atomic(work) {
+      const plan = await work(memoryReader(rows));
+      for (const op of plan.ops) applyOp(rows, op);
+    },
+  };
+  return createEndpointStorage(engine, options);
+}
+
+function memoryReader(rows: Map<string, Row>): PlanReader {
+  return {
+    async read(collection, key) {
+      const row = rows.get(targetOf(collection, key));
+      return { live: row !== undefined && row.json !== null, version: row?.version ?? 0 };
+    },
+    async countLive(collection, playerKey) {
+      let count = 0;
+      for (const row of rows.values()) {
+        if (row.collection === collection && row.json !== null && playerKeyOf(row.key) === playerKey) count += 1;
+      }
+      return count;
     },
   };
 }
 
-function clone(value: unknown): unknown {
-  return value === undefined ? null : JSON.parse(JSON.stringify(value));
+function applyOp(rows: Map<string, Row>, op: PlannedOp): void {
+  if (op.kind === "remove") {
+    rows.delete(targetOf(op.collection, op.key));
+    return;
+  }
+  rows.set(targetOf(op.collection, op.key), {
+    collection: op.collection,
+    key: op.key,
+    json: op.data === null ? null : JSON.stringify(op.data),
+    version: op.version,
+  });
 }
 
-function cloneRecord(data: RecordData): RecordData {
-  return JSON.parse(JSON.stringify(data));
+function targetOf(collection: string, key: string): string {
+  return `${collection}\u0000${key}`;
 }

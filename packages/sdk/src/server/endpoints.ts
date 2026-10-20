@@ -1,3 +1,4 @@
+import { DslResponse } from "../dsl/steps.js";
 import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { openV1Envelope } from "../protocol/envelope-v1.js";
@@ -14,12 +15,30 @@ import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
 import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
+import type { EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
 
 // Keys that address the call rather than carry input. They never reach the handler.
 const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
 
 // No secrets are configured, so every name is absent. Handlers get null, never a value from elsewhere.
 const NO_SECRETS: SecretStore = { get: () => null };
+
+// Static endpoints from ServerOptions first, then the endpoints the editor pushed (compiled from DSL documents).
+function resolveEndpoint(ctx: ServerContext, slug: string): { handler: EndpointHandler; requiresSecretKey: boolean } | null {
+  if (Object.hasOwn(ctx.options.endpoints, slug)) {
+    return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false };
+  }
+  const entry = ctx.catalog.endpoints.get(slug);
+  if (entry === undefined || !entry.enabled) return null;
+  return { handler: entry.compiled.handler, requiresSecretKey: entry.compiled.requiresSecretKey };
+}
+
+// Static workflows from ServerOptions, overridden by the workflows the editor pushed.
+function workflowsOf(ctx: ServerContext): Record<string, WorkflowFunction> {
+  const workflows: Record<string, WorkflowFunction> = { ...ctx.options.workflows };
+  for (const [id, entry] of ctx.catalog.workflows) workflows[id] = entry.compiled.definition;
+  return workflows;
+}
 
 // What a request has established so far. Errors are shaped from it, so it is filled in as the call progresses.
 interface CallState {
@@ -28,13 +47,15 @@ interface CallState {
   responseKey: V2ResponseKey | null;
 }
 
-// Access for an endpoint call: the public key, or the secret key (which also unlocks secret-only modes).
-function authorize(ctx: ServerContext, request: Request): { hasSecretKey: boolean } | null {
+// Access for a call. The secret arrives as x-secret-key or x-api-key; the public key as x-public-key, x-api-key, or the
+// apiKey query parameter. Keys are compared in constant time.
+export function authorize(ctx: ServerContext, request: Request, url: URL): { hasSecretKey: boolean } | null {
   const { options } = ctx;
-  const publicKey = request.headers.get("x-public-key") ?? request.headers.get("x-api-key") ?? "";
-  const secretKey = request.headers.get("x-secret-key") ?? "";
-  const hasSecretKey = options.secretKey !== null && safeEqual(secretKey, options.secretKey);
-  const hasPublicKey = safeEqual(publicKey, options.publicKey);
+  const apiKey = request.headers.get("x-api-key");
+  const presentedSecret = request.headers.get("x-secret-key") ?? apiKey ?? "";
+  const presentedPublic = request.headers.get("x-public-key") ?? apiKey ?? url.searchParams.get("apiKey") ?? "";
+  const hasSecretKey = options.secretKey !== null && safeEqual(presentedSecret, options.secretKey);
+  const hasPublicKey = safeEqual(presentedPublic, options.publicKey);
   if (!hasSecretKey && !hasPublicKey) return null;
   return { hasSecretKey };
 }
@@ -45,7 +66,7 @@ export async function handleEndpoint(
   url: URL,
   pathSlug: string | null,
 ): Promise<Response> {
-  const access = authorize(ctx, request);
+  const access = authorize(ctx, request, url);
   if (access === null) {
     return errorResponse({ status: 401, code: "UNAUTHORIZED", message: "The request has no valid project key." });
   }
@@ -92,10 +113,18 @@ async function runCall(
   const { options } = ctx;
   const envelope = body !== null && isEncryptedBody(body) ? body : null;
   const slug = resolveSlug(pathSlug, body, envelope !== null);
-  if (!Object.hasOwn(options.endpoints, slug)) {
+  const target = resolveEndpoint(ctx, slug);
+  if (target === null) {
     throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `No endpoint named "${slug}".`);
   }
-  const definition = options.endpoints[slug]!;
+  if (target.requiresSecretKey && !hasSecretKey) {
+    throw new ProtocolError(
+      401,
+      "SECRET_KEY_REQUIRED",
+      `Endpoint "${slug}" requires a Network Storage secret key. Send it in the x-secret-key header.`,
+    );
+  }
+  const handler = target.handler;
   const nowMs = ctx.now();
 
   const headerCredentials = credentialsOf(request, url, envelope ?? body);
@@ -176,7 +205,7 @@ async function runCall(
       : withoutReservedKeys(omitKeys(commandBody ?? {}, SHELL_KEYS));
 
   const outcome = await runEndpoint(
-    definition,
+    handler,
     {
       input,
       player: identity.steamId === "anonymous" ? null : { steamId: identity.steamId },
@@ -185,9 +214,9 @@ async function runCall(
       revision: null,
     },
     {
-      storage: options.storage,
+      storage: ctx.storage(),
       fetchPolicy: options.fetchPolicy,
-      workflows: options.workflows ?? {},
+      workflows: workflowsOf(ctx),
       globals: options.globals ?? {},
       secrets: options.secrets ?? NO_SECRETS,
       now: ctx.now,
@@ -196,12 +225,15 @@ async function runCall(
     },
   );
   if (outcome.writes.length > 0) {
-    await options.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
+    await ctx.storage().apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
   }
 
-  const success = successBody(outcome.value);
-  if (state.responseKey === null) return jsonResponse(success, 200);
-  return jsonResponse(await sealV2Response(state.responseKey, success), 200);
+  // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.
+  const response = outcome.value instanceof DslResponse ? outcome.value : null;
+  const success = successBody(response === null ? outcome.value : response.body);
+  const status = response?.status ?? 200;
+  if (state.responseKey === null) return jsonResponse(success, status);
+  return jsonResponse(await sealV2Response(state.responseKey, success), status);
 }
 
 // The route slug, or the one the body claims for a plain call. Encrypted bodies claim it inside the envelope,

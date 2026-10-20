@@ -1,6 +1,6 @@
 export function jsonResponse(
   body: unknown,
-  status: number,
+  status = 200,
   extraHeaders?: Record<string, string>,
 ): Response {
   const headers = new Headers(extraHeaders);

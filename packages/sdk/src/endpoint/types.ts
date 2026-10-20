@@ -73,8 +73,3 @@ export interface EndpointScope {
 export type WorkflowFunction = (input: Record<string, unknown>, ns: Ns) => unknown;
 
 export type EndpointHandler = (req: EndpointRequest, ns: Ns, scope: EndpointScope) => unknown;
-
-// A script endpoint as the server runs it. `handle` is synchronous; see the note above EndpointRequest.
-export interface EndpointDefinition {
-  handle: EndpointHandler;
-}

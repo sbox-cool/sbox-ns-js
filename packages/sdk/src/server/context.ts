@@ -1,12 +1,19 @@
 import type { IdentityOptions } from "../protocol/identity.js";
-import type { ServerOptions, SessionRevocations } from "./options.js";
+import type { EndpointStorage } from "../storage/types.js";
+import { createCatalog, storageDefinitionOf, valuesOf, type Catalog } from "./catalog.js";
 import { createConfigSource, type ConfigSource } from "./config.js";
+import type { ServerOptions, SessionRevocations, ValuesDocument } from "./options.js";
 
 export interface ServerContext {
   readonly options: ServerOptions;
   readonly config: ConfigSource;
   readonly revocations: SessionRevocations;
+  readonly catalog: Catalog;
   now(): number;
+  // Game values: static ServerOptions values merged with the ones the editor pushed.
+  values(): ValuesDocument;
+  // The storage for the current catalog. Rebuilt whenever the catalog revision changes.
+  storage(): EndpointStorage;
 }
 
 // In-process revocation list. Entries live until their session would have expired anyway. Multi-instance
@@ -24,11 +31,22 @@ function createMemoryRevocations(): SessionRevocations {
 }
 
 export function createServerContext(options: ServerOptions): ServerContext {
+  const catalog = createCatalog();
+  const values = (): ValuesDocument => valuesOf(catalog, options.values);
+  let cached: { readonly revision: number; readonly storage: EndpointStorage } | null = null;
   return {
     options,
     config: createConfigSource(options),
     revocations: options.sessionRevocations ?? createMemoryRevocations(),
+    catalog,
     now: options.now ?? (() => Date.now()),
+    values,
+    storage() {
+      if (cached === null || cached.revision !== catalog.revision) {
+        cached = { revision: catalog.revision, storage: options.storage(storageDefinitionOf(catalog, values())) };
+      }
+      return cached.storage;
+    },
   };
 }
 

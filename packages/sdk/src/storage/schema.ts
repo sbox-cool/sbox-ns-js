@@ -1,9 +1,35 @@
 // Port of SboxNetworkStorage.Server/Owner/OwnerRecordValidation.cs. Same keyword set, same
 // standard-schema detection, same bare field-map form, same error paths and messages.
-// Known difference: "datetime" uses Date.parse (ISO-8601 and RFC 2822 forms) where the server uses
-// DateTimeOffset.TryParse with the invariant culture; the accepted set is close but not identical.
+// "datetime" follows the server's DateTimeOffset.TryParse for ISO 8601 / RFC 3339 forms, with calendar and
+// clock bounds. Known difference: .NET also accepts other invariant-culture forms (e.g. "March 5, 2024"); those are rejected here.
 import { isValidRecordKey } from "./keys.js";
 import { isPlainObject } from "./json.js";
+
+// Calendar- and clock-checked ISO 8601 / RFC 3339 date-time. Date.parse is not used because it silently
+// normalizes impossible dates (2024-02-30 becomes 2024-03-01).
+const DATETIME = /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,7})?)?)?(?:[Zz]|([+-])(\d{2}):?(\d{2}))?$/;
+
+function isDateTime(value: string): boolean {
+  const match = DATETIME.exec(value);
+  if (!match) return false;
+  const [, year = "", month = "", day = "", hour = "0", minute = "0", second = "0", sign, offsetHour = "0", offsetMinute = "0"] = match;
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (y < 1 || m < 1 || m > 12 || d < 1 || d > daysInMonth(y, m)) return false;
+  if (Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) return false;
+  if (sign !== undefined) {
+    const oh = Number(offsetHour);
+    const om = Number(offsetMinute);
+    if (om > 59 || oh > 14 || (oh === 14 && om > 0)) return false;
+  }
+  return true;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
 
 const KEYWORDS = new Set([
   "type", "properties", "required", "additionalProperties", "enum", "items",
@@ -19,7 +45,7 @@ function hasOwn(obj: object, key: string): boolean {
 }
 
 function isInt32(value: unknown): value is number {
-  return Number.isInteger(value) && (value as number) >= -INT32_MAX - 1 && (value as number) <= INT32_MAX;
+  return typeof value === "number" && Number.isInteger(value) && value >= -INT32_MAX - 1 && value <= INT32_MAX;
 }
 
 // Returns the first violation message (with its path), or null when the value conforms.
@@ -218,7 +244,7 @@ function checkType(type: string, value: unknown, path: string): string | null {
       valid = typeof value === "string" && isValidRecordKey(value);
       break;
     case "datetime":
-      valid = typeof value === "string" && !Number.isNaN(Date.parse(value));
+      valid = typeof value === "string" && isDateTime(value);
       break;
     case "null":
       valid = value === null;

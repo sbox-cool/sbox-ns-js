@@ -2,6 +2,7 @@ import { FetchError } from "../endpoint/fetch.js";
 import { RunCancelled, ScriptFailure } from "../endpoint/runtime.js";
 import { ProtocolError } from "../protocol/errors.js";
 import type { RequestCredentials } from "../protocol/identity.js";
+import { StorageError } from "../storage/errors.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 
@@ -32,6 +33,7 @@ export function describeError(error: unknown): ErrorDescription {
   }
   if (error instanceof ScriptFailure) return { status: error.status, code: error.code, message: error.message };
   if (error instanceof FetchError) return { status: 502, code: error.code, message: error.message };
+  if (error instanceof StorageError) return { status: error.status, code: error.code, message: error.message };
   if (error instanceof RunCancelled) return { status: 499, code: "REQUEST_CANCELLED", message: error.message };
   return { status: 500, code: "INTERNAL_ERROR", message: "The request could not be completed." };
 }
@@ -47,18 +49,24 @@ export function safeEqual(a: string, b: string): boolean {
   return difference === 0;
 }
 
-export async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+// Reads a JSON body of any shape. An empty body is undefined.
+export async function readJsonValue(request: Request): Promise<unknown> {
   const text = await request.text();
   if (text.length > MAX_JSON_BODY_CHARS) {
     throw new ProtocolError(413, "BODY_TOO_LARGE", "The request body is too large.");
   }
-  if (text.trim().length === 0) return {};
-  let parsed: unknown;
+  if (text.trim().length === 0) return undefined;
   try {
-    parsed = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
     throw new ProtocolError(400, "INVALID_JSON", "The request body is not valid JSON.");
   }
+}
+
+// Reads a JSON object body. An empty body is an empty object.
+export async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+  const parsed = await readJsonValue(request);
+  if (parsed === undefined) return {};
   if (!isRecord(parsed)) throw new ProtocolError(400, "INVALID_BODY", "The request body must be a JSON object.");
   return parsed;
 }
@@ -77,4 +85,13 @@ export function credentialsOf(
 
 export function hasMethodBody(method: string): boolean {
   return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+// Decodes one URL path segment. A malformed escape is the caller's fault, not a server error.
+export function pathSegment(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new ProtocolError(400, "INVALID_KEY", "The path contains an invalid escape sequence.");
+  }
 }
