@@ -56,9 +56,16 @@ function splitRoute(parts: readonly string[]): SplitRoute | null {
 
 const NOT_FOUND = { status: 404, code: "ROUTE_NOT_FOUND", message: "No route matches this path." } as const;
 
+// Capabilities this server implements. Add a name only when its behaviour is complete.
+const SERVER_CAPABILITIES = ["library-error-envelope"] as const;
+
 async function route(ctx: ServerContext, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter((part) => part.length > 0);
+  // Capability discovery. Lists only what this server implements; clients gate behaviour on these names.
+  if (parts.length === 2 && parts[0] === "v3" && parts[1] === "server-info" && request.method === "GET") {
+    return jsonResponse({ capabilities: SERVER_CAPABILITIES, api: { root: "/api", aliases: ["/v3", "/v1"] } });
+  }
   const split = splitRoute(parts);
   if (split === null || split.family === undefined || split.project === undefined) return errorResponse(NOT_FOUND);
   const { family, project, rest } = split;
