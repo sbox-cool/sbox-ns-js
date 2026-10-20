@@ -17,6 +17,7 @@ import type { ServerContext } from "./context.js";
 import { authorize, handleEndpoint } from "./endpoints.js";
 import { pathSegment, readJsonBody, readJsonValue, safeEqual } from "./http.js";
 import { parseQuery, type QueryDefinition } from "./query-routes.js";
+import { upgradeSource } from "./source-upgrade.js";
 
 // Editor-facing management API. Every route needs the secret key except revision-init, which the game client
 // calls with its public key. Section writes are all-or-nothing: a batch that fails to compile changes nothing.
@@ -82,19 +83,6 @@ function arrayOf(value: unknown, label: string): unknown[] {
 
 function kindOfPath(segment: string | undefined): ResourceKind | null {
   return KINDS.find((kind) => kind === segment) ?? null;
-}
-
-function kindOfSingular(value: unknown): ResourceKind | null {
-  switch (value) {
-    case "endpoint":
-      return "endpoints";
-    case "collection":
-      return "collections";
-    case "workflow":
-      return "workflows";
-    default:
-      return null;
-  }
 }
 
 // Compiles one section without committing it. A non-array value fails the section, never the request.
@@ -447,18 +435,13 @@ async function autoTest(ctx: ServerContext, request: Request, url: URL): Promise
 }
 
 async function sourceUpgrade(ctx: ServerContext, request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const kind = kindOfSingular(body["kind"]);
-  if (kind === null) {
-    throw new ProtocolError(400, "VALIDATION_FAILED", "kind must be endpoint, collection, or workflow.");
-  }
-  // The source is already in the current DSL; this validates it against that version and reports it.
-  const section = compileSection(ctx, kind, [body]);
-  if (!section.report.ok) return writeFailure(kind, section.report.message);
-  return jsonResponse(
-    { ok: true, kind: body["kind"], id: section.report.results[0]?.id ?? null, sourceVersion: 1 },
-    200,
-  );
+  const root = await readJsonValue(request);
+  // A source wrapped in a `resource` object or array is the payload; otherwise the body itself is.
+  const wrapped = isRecord(root) ? root["resource"] : undefined;
+  const payload = isRecord(wrapped) || Array.isArray(wrapped) ? wrapped : root;
+  if (!isRecord(payload)) throw new ProtocolError(400, "VALIDATION_FAILED", "Body must be a source resource object.");
+  const outcome = upgradeSource(payload, { parseYaml: ctx.options.parseYaml, stringifyYaml: ctx.options.stringifyYaml });
+  return jsonResponse(outcome.body, outcome.ok ? 200 : 400);
 }
 
 async function packageSync(ctx: ServerContext, request: Request): Promise<Response> {

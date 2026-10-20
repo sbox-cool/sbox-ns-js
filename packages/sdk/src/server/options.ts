@@ -46,6 +46,8 @@ export interface ServerOptions {
   storage: StorageFactory;
   // Parses YAML source documents uploaded through management sync. Without one, YAML sources are rejected.
   parseYaml?: (text: string) => unknown;
+  // Writes the YAML text returned by source upgrade. Without one, upgrade cannot produce YAML and fails.
+  stringifyYaml?: (value: unknown) => string;
   fetchPolicy: FetchPolicy;
   replayStore: ReplayStore;
   now?: () => number;

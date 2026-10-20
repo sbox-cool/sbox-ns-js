@@ -2,6 +2,7 @@ import {
   compileCollection,
   compileEndpoint,
   compileWorkflow,
+  DefinitionError,
   type CompiledCollection,
   type CompiledEndpoint,
   type CompiledWorkflow,
@@ -183,7 +184,7 @@ function workflowDocument(record: Readonly<Record<string, unknown>>): Record<str
   };
 }
 
-function documentFor(kind: ResourceKind, record: Readonly<Record<string, unknown>>, parse: Parser): Record<string, unknown> {
+export function documentFor(kind: ResourceKind, record: Readonly<Record<string, unknown>>, parse: Parser): Record<string, unknown> {
   const text = record["sourceText"];
   if (typeof text === "string") return sourceOf(record, parse, text);
   if (kind === "endpoints") return endpointDocument(record);
@@ -221,6 +222,17 @@ export function compileBatch(kind: ResourceKind, records: readonly unknown[], pa
     }
   }
   return { ok: results.every((result) => result.ok), results, compiled };
+}
+
+// Compile-checks one record without committing it. A DSL error reports the path it failed at; any other failure reports the root.
+export function definitionFault(kind: ResourceKind, record: Readonly<Record<string, unknown>>, parse: Parser): { path: string; message: string } | null {
+  try {
+    compileOne(kind, record, parse);
+    return null;
+  } catch (error) {
+    if (error instanceof DefinitionError) return { path: error.path, message: error.message };
+    return { path: "/", message: messageOf(error) };
+  }
 }
 
 export function commitCompiled(catalog: Catalog, items: readonly Compiled[]): void {

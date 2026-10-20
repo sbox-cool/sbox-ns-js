@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { nodeHandler } from "../../src/adapters/node.js";
 import { createSqliteStorage, type SqliteDatabase } from "../../src/storage/index.js";
 import { createMemoryReplayStore } from "../../src/protocol/replay.js";
@@ -38,6 +38,7 @@ export function referenceOptions(): ServerOptions {
     endpoints: {},
     storage: (definition) => createSqliteStorage({ db, collections: definition.collections, values: definition.values }),
     parseYaml,
+    stringifyYaml,
     fetchPolicy: { allowedHosts: [], resolveHost: async () => [] },
     replayStore: createMemoryReplayStore(),
   };
