@@ -570,7 +570,17 @@ export function compareValues(left: unknown, op: string, right: unknown): boolea
   }
 }
 
-// Evaluates a declarative check `{ field, op, value }` where field and value may be templates.
+// Evaluates a declarative check `{ field, op, value }`. `field` is a path such as `input.n` (or a template
+// that resolves to one), matching the reference ResolveFieldForComparison; `value` is a template.
 export function evaluateCheck(check: { field: unknown; op: string; value: unknown }, scope: Scope, options: EvalOptions = {}): boolean {
-  return compareValues(resolveTemplate(check.field, scope, options), check.op, resolveTemplate(check.value, scope, options));
+  return compareValues(resolveField(check.field, scope, options), check.op, resolveTemplate(check.value, scope, options));
+}
+
+function resolveField(field: unknown, scope: Scope, options: EvalOptions): unknown {
+  if (typeof field !== "string" || field.length === 0) return undefined;
+  if (!field.includes("{{")) return evaluateExpression(field.trim(), scope, options);
+  if (SINGLE_TEMPLATE.test(field)) return resolveTemplate(field, scope, options);
+  const resolved = resolveTemplate(field, scope, options);
+  if (typeof resolved === "string" && !resolved.includes("{{")) return evaluateExpression(resolved.trim(), scope, options);
+  return resolved;
 }

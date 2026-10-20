@@ -70,7 +70,7 @@ export function upgradeSource(payload: Record<string, unknown>, tools: SourceToo
   const compiled = compileSource(payload, kindText, tools.parseYaml);
   if (!compiled.ok) return failure(diagnostic("SOURCE_COMPILE_FAILED", compiled.message, "/sourceText"));
 
-  const canonical = canonicalOf(compiled.body);
+  const canonical = canonicalOf(kindText, compiled.body);
   const diagnostics = [
     ...validateCanonical(kindText, canonical, tools.parseYaml),
     ...ambiguityDiagnostics(kindText, compiled.source),
@@ -202,13 +202,20 @@ function mergeFields(first: Record<string, unknown>, second: Record<string, unkn
   return merged;
 }
 
-function canonicalOf(compiled: Record<string, unknown>): Record<string, unknown> {
+// The canonical record keeps only fields the upgrade recognises. Unrecognised fields are reported as warnings by
+// ambiguityDiagnostics and are never carried into the validated record.
+function canonicalOf(kind: SourceKind, compiled: Record<string, unknown>): Record<string, unknown> {
+  const allowed = allowedFieldsOf(kind);
   const canonical: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(compiled)) {
-    if (LEGACY_SOURCE_ONLY_KEYS.has(key) || key === "kind" || key === "resourceKind") continue;
+    if (LEGACY_SOURCE_ONLY_KEYS.has(key) || key === "kind" || key === "resourceKind" || !allowed.has(key)) continue;
     canonical[key] = structuredClone(value);
   }
   return canonical;
+}
+
+function allowedFieldsOf(kind: SourceKind): Set<string> {
+  return new Set([...TOP_LEVEL_ALLOWED, ...(KIND_ALLOWED.get(kind) ?? [])]);
 }
 
 // Validates the canonical record with the compiler a management write uses. Endpoint, collection and workflow records
@@ -241,7 +248,7 @@ function storeKindOf(kind: "endpoint" | "workflow" | "collection"): ResourceKind
 // Warns about top-level fields the upgrade does not recognise, so they are never silently dropped.
 function ambiguityDiagnostics(kind: SourceKind, source: Record<string, unknown> | null): UpgradeDiagnostic[] {
   if (source === null) return [];
-  const allowed = new Set([...TOP_LEVEL_ALLOWED, ...(KIND_ALLOWED.get(kind) ?? [])]);
+  const allowed = allowedFieldsOf(kind);
   return Object.keys(source)
     .filter((key) => !allowed.has(key))
     .map((key) => ({
