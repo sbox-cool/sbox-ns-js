@@ -20,6 +20,37 @@ interface Access {
 // Successful Idempotency-Key appends, per server, so a replay returns the first response unchanged.
 const idempotentAppends = new WeakMap<ServerContext, Map<string, Record<string, unknown>>>();
 
+// Global-collection appends are limited per writer per collection per UTC day, as the reference server does
+// (8640 saves a day). Counters of earlier days are dropped on rollover.
+const APPEND_SAVES_PER_DAY = 8640;
+const appendCounts = new WeakMap<ServerContext, Map<string, number>>();
+
+function appendCountsOf(ctx: ServerContext): Map<string, number> {
+  const counts = appendCounts.get(ctx) ?? new Map<string, number>();
+  appendCounts.set(ctx, counts);
+  return counts;
+}
+
+// Counts one append by `writer` to `collectionId` against the UTC day containing `nowMs`; throws once over the limit.
+export function takeAppendQuota(counts: Map<string, number>, nowMs: number, collectionId: string, writer: string): void {
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  for (const key of counts.keys()) {
+    if (!key.endsWith(`:${day}`)) counts.delete(key);
+  }
+  const scope = `${collectionId}:${writer}:${day}`;
+  const count = (counts.get(scope) ?? 0) + 1;
+  counts.set(scope, count);
+  if (count > APPEND_SAVES_PER_DAY) {
+    const perHour = Math.round(APPEND_SAVES_PER_DAY / 24);
+    const perMinute = (APPEND_SAVES_PER_DAY / 1440).toFixed(1);
+    throw new ProtocolError(
+      429,
+      "RATE_LIMIT_DAILY",
+      `Rate limit exceeded for this player: max ${APPEND_SAVES_PER_DAY} saves per day (~${perHour}/hr, ~${perMinute}/min). Resets at midnight UTC.`,
+    );
+  }
+}
+
 const STEAM_ID = /^\d{17}$/;
 
 function accessOf(ctx: ServerContext, request: Request, url: URL): Access {
@@ -247,6 +278,7 @@ async function appendRecord(
   if (replay !== undefined) return jsonResponse(replay);
 
   const writer = await playerOf(ctx, request, url, body);
+  takeAppendQuota(appendCountsOf(ctx), ctx.now(), collectionId, writer);
   const id = newId();
   const record = { ...body, _id: id, _timestamp: ctx.now(), _writerId: writer };
   const storage = ctx.storage();
