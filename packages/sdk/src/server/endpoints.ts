@@ -1,0 +1,270 @@
+import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
+import { ProtocolError } from "../protocol/errors.js";
+import { openV1Envelope } from "../protocol/envelope-v1.js";
+import { openV2Envelope, sealV2Response, type V2ResponseKey } from "../protocol/envelope-v2.js";
+import { readField } from "../protocol/fields.js";
+import { clampReplayWindow, consumeRequestId } from "../protocol/replay.js";
+import { claimedSteamId, readSessionToken, resolvePlayer } from "../protocol/identity.js";
+import { isLibraryCaller, libraryErrorBody } from "../protocol/library.js";
+import { withoutReservedKeys } from "../protocol/payload.js";
+import { envelopeKindOf, securityDenial, type EnvelopeKind } from "../protocol/security.js";
+import { verifyAuthSession } from "../protocol/sessions.js";
+import { isRecord } from "../util/guards.js";
+import { jsonResponse } from "../util/http.js";
+import { identityOptionsFor, type ServerContext } from "./context.js";
+import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
+import type { LoadedRequestKey } from "../protocol/crypto.js";
+
+// Keys that address the call rather than carry input. They never reach the handler.
+const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
+
+// No secrets are configured, so every name is absent. Handlers get null, never a value from elsewhere.
+const NO_SECRETS: SecretStore = { get: () => null };
+
+// What a request has established so far. Errors are shaped from it, so it is filled in as the call progresses.
+interface CallState {
+  library: boolean;
+  requestId: string | null;
+  responseKey: V2ResponseKey | null;
+}
+
+// Access for an endpoint call: the public key, or the secret key (which also unlocks secret-only modes).
+function authorize(ctx: ServerContext, request: Request): { hasSecretKey: boolean } | null {
+  const { options } = ctx;
+  const publicKey = request.headers.get("x-public-key") ?? request.headers.get("x-api-key") ?? "";
+  const secretKey = request.headers.get("x-secret-key") ?? "";
+  const hasSecretKey = options.secretKey !== null && safeEqual(secretKey, options.secretKey);
+  const hasPublicKey = safeEqual(publicKey, options.publicKey);
+  if (!hasSecretKey && !hasPublicKey) return null;
+  return { hasSecretKey };
+}
+
+export async function handleEndpoint(
+  ctx: ServerContext,
+  request: Request,
+  url: URL,
+  pathSlug: string | null,
+): Promise<Response> {
+  const access = authorize(ctx, request);
+  if (access === null) {
+    return errorResponse({ status: 401, code: "UNAUTHORIZED", message: "The request has no valid project key." });
+  }
+  const state: CallState = { library: false, requestId: null, responseKey: null };
+  try {
+    const body = request.method === "GET" ? null : await readJsonBody(request);
+    state.library = isLibraryCaller(request.headers, body);
+    return await runCall(ctx, request, url, pathSlug, body, access.hasSecretKey, state);
+  } catch (error) {
+    return failureResponse(error, state);
+  }
+}
+
+// Library callers read the outcome from the body: they get HTTP 200 with an error envelope. Other callers get
+// the real status. A sealed response carries the error in encrypted form either way.
+async function failureResponse(error: unknown, state: CallState): Promise<Response> {
+  const description = describeError(error);
+  if (!state.library) {
+    if (state.responseKey === null) return errorResponse(description);
+    const body = errorBody(description.code, description.message);
+    if (description.security !== undefined) body.security = description.security;
+    return jsonResponse(await sealV2Response(state.responseKey, body), description.status);
+  }
+  const body = libraryErrorBody({
+    status: description.status,
+    code: description.code,
+    message: description.message,
+    requestId: state.requestId ?? crypto.randomUUID(),
+    security: description.security,
+  });
+  if (state.responseKey === null) return jsonResponse(body, 200);
+  return jsonResponse(await sealV2Response(state.responseKey, body), 200);
+}
+
+async function runCall(
+  ctx: ServerContext,
+  request: Request,
+  url: URL,
+  pathSlug: string | null,
+  body: Readonly<Record<string, unknown>> | null,
+  hasSecretKey: boolean,
+  state: CallState,
+): Promise<Response> {
+  const { options } = ctx;
+  const envelope = body !== null && isEncryptedBody(body) ? body : null;
+  const slug = resolveSlug(pathSlug, body, envelope !== null);
+  if (!Object.hasOwn(options.endpoints, slug)) {
+    throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `No endpoint named "${slug}".`);
+  }
+  const definition = options.endpoints[slug]!;
+  const nowMs = ctx.now();
+
+  const headerCredentials = credentialsOf(request, url, envelope ?? body);
+  const presentedToken = readSessionToken(headerCredentials);
+  const sessionId =
+    presentedToken !== null && options.sessionSecret !== null && options.settings.enableAuthSessions
+      ? (await verifyAuthSession(options.sessionSecret, presentedToken, options.projectId, nowMs)).id
+      : null;
+
+  let commandBody: Readonly<Record<string, unknown>> | null = body;
+  let envelopeKind: EnvelopeKind = "none";
+  let envelopeKeyFound = false;
+  if (envelope !== null) {
+    const claimed = claimedSteamId(headerCredentials);
+    envelopeKind = envelopeKindOf(readField(envelope, "version"));
+    if (envelopeKind === "unsupported") {
+      throw new ProtocolError(400, "ENVELOPE_UNSUPPORTED", "The encrypted request version is not supported.");
+    }
+    if (envelopeKind === "v1") {
+      const opened = await openV1Envelope({
+        raw: envelope,
+        apiKey: options.publicKey,
+        projectId: options.projectId,
+        endpointSlug: slug,
+        steamId: claimed,
+        sessionId,
+      });
+      state.requestId = opened.requestId;
+      commandBody = opened.payload;
+      envelopeKeyFound = true;
+      await consumeEnvelopeId(ctx, opened.requestId, opened.identityKey, nowMs);
+    } else {
+      const key = findRequestKey(ctx, readField(envelope, "keyId"), nowMs);
+      if (key === null) {
+        throw new ProtocolError(401, "REQUEST_SIGNATURE_INVALID", "The encrypted request key is not recognised.");
+      }
+      const opened = await openV2Envelope({
+        raw: envelope,
+        projectId: options.projectId,
+        endpointSlug: slug,
+        key,
+        steamId: claimed,
+        sessionId,
+      });
+      state.requestId = opened.requestId;
+      state.responseKey = opened.responseKey;
+      commandBody = opened.payload;
+      envelopeKeyFound = true;
+      await consumeEnvelopeId(ctx, opened.requestId, opened.identityKey, nowMs);
+    }
+  }
+
+  const config = await ctx.config.current(nowMs, false);
+  const denial = securityDenial({
+    project: options.settings,
+    configVersion: config.configVersion,
+    body: commandBody,
+    hasSecretKey,
+    presentedSession: presentedToken !== null,
+    envelope: envelopeKind,
+    envelopeKeyFound,
+  });
+  if (denial !== null) throw denial;
+
+  const credentials = credentialsOf(request, url, commandBody);
+  const identity = await resolvePlayer(
+    credentials,
+    claimedSteamId(credentials),
+    identityOptionsFor(ctx, slug, nowMs),
+  );
+  if (identity.sessionId !== null && (await ctx.revocations.isRevoked(identity.sessionId))) {
+    throw new ProtocolError(401, "AUTH_SESSION_REVOKED", "The auth session was revoked.");
+  }
+
+  const input =
+    request.method === "GET"
+      ? withoutReservedKeys(omitKeys(Object.fromEntries(url.searchParams), SHELL_KEYS))
+      : withoutReservedKeys(omitKeys(commandBody ?? {}, SHELL_KEYS));
+
+  const outcome = await runEndpoint(
+    definition,
+    {
+      input,
+      player: identity.steamId === "anonymous" ? null : { steamId: identity.steamId },
+      method: request.method === "GET" ? "GET" : "POST",
+      endpoint: slug,
+      revision: null,
+    },
+    {
+      storage: options.storage,
+      fetchPolicy: options.fetchPolicy,
+      workflows: options.workflows ?? {},
+      globals: options.globals ?? {},
+      secrets: options.secrets ?? NO_SECRETS,
+      now: ctx.now,
+      log: options.log ?? (() => undefined),
+      signal: request.signal,
+    },
+  );
+  if (outcome.writes.length > 0) {
+    await options.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
+  }
+
+  const success = successBody(outcome.value);
+  if (state.responseKey === null) return jsonResponse(success, 200);
+  return jsonResponse(await sealV2Response(state.responseKey, success), 200);
+}
+
+// The route slug, or the one the body claims for a plain call. Encrypted bodies claim it inside the envelope,
+// which the envelope open already binds, so only the route or the envelope field is read here.
+function resolveSlug(pathSlug: string | null, body: Readonly<Record<string, unknown>> | null, encrypted: boolean): string {
+  const claim = encrypted
+    ? nonEmpty(body === null ? undefined : body.endpointSlug)
+    : nonEmpty(body?._endpointSlug) ?? nonEmpty(body?.endpoint);
+  if (pathSlug === null) {
+    if (claim === null) throw new ProtocolError(400, "ENDPOINT_SLUG_REQUIRED", "The endpoint name is required.");
+    return claim;
+  }
+  if (claim !== null && claim !== pathSlug && !encrypted) {
+    throw new ProtocolError(400, "ENDPOINT_SLUG_MISMATCH", "The body names a different endpoint than the route.");
+  }
+  return pathSlug;
+}
+
+async function consumeEnvelopeId(
+  ctx: ServerContext,
+  requestId: string,
+  identityKey: string,
+  nowMs: number,
+): Promise<void> {
+  await consumeRequestId(ctx.options.replayStore, {
+    projectId: ctx.options.projectId,
+    identityKey,
+    requestId,
+    windowSeconds: clampReplayWindow(ctx.options.settings.encryptedRequestWindowSeconds),
+    nowMs,
+  });
+}
+
+// Finds the request key for an envelope. A retired key is accepted only while its grace window is open.
+function findRequestKey(ctx: ServerContext, keyId: string, nowMs: number): LoadedRequestKey | null {
+  const ring = ctx.options.requestKeys;
+  if (ring === undefined) return null;
+  const key = ring.keys.find((candidate) => candidate.keyId === keyId);
+  if (key === undefined) return null;
+  if (key.retiredAt === null) return key;
+  if (key.graceUntil === null) return null;
+  return nowMs < Date.parse(key.graceUntil) ? key : null;
+}
+
+function isEncryptedBody(body: Readonly<Record<string, unknown>>): boolean {
+  return body.encrypted === true || "encryptedPayload" in body || "ciphertext" in body;
+}
+
+function nonEmpty(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function omitKeys(raw: Readonly<Record<string, unknown>>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!keys.includes(key)) out[key] = value;
+  }
+  return out;
+}
+
+// A handler may return any value. Objects keep their fields; anything else is returned under `result`.
+function successBody(value: unknown): Record<string, unknown> {
+  if (value === undefined || value === null) return { ok: true };
+  if (isRecord(value)) return { ...value, ok: true };
+  return { ok: true, result: value };
+}

@@ -1,0 +1,73 @@
+{
+  "name": "@sbox-ns/sdk",
+  "version": "0.1.0",
+  "description": "Backend SDK for sbox-ns: s&box player verification, auth sessions, encrypted requests (v1 and v2), the endpoint kit, storage adapters, a typed client and modules.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "homepage": "https://sboxns.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sbox-cool/sbox-ns-js.git",
+    "directory": "packages/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/sbox-cool/sbox-ns-js/issues"
+  },
+  "keywords": ["sbox", "s&box", "network-storage", "backend", "sbox-ns"],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "exports": {
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "default": "./dist/protocol/index.js"
+    },
+    "./endpoint": {
+      "types": "./dist/endpoint/index.d.ts",
+      "default": "./dist/endpoint/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "default": "./dist/storage/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    },
+    "./modules": {
+      "types": "./dist/modules/index.d.ts",
+      "default": "./dist/modules/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    },
+    "./adapters/fetch": {
+      "types": "./dist/adapters/fetch.d.ts",
+      "default": "./dist/adapters/fetch.js"
+    },
+    "./adapters/express": {
+      "types": "./dist/adapters/express.d.ts",
+      "default": "./dist/adapters/express.js"
+    },
+    "./adapters/hono": {
+      "types": "./dist/adapters/hono.d.ts",
+      "default": "./dist/adapters/hono.js"
+    },
+    "./adapters/fastify": {
+      "types": "./dist/adapters/fastify.d.ts",
+      "default": "./dist/adapters/fastify.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
