@@ -8,7 +8,7 @@ import type { Bytes } from "../util/bytes.js";
 
 export const V2_VERSION = "2";
 export const V2_ALGORITHM = "rsa-oaep-256+aes-256-gcm";
-const RESPONSE_LABEL = "sboxcool.network-storage.encrypted-response.v2";
+export const RESPONSE_LABEL = "sboxcool.network-storage.encrypted-response.v2";
 const MIN_NONCE_LENGTH = 8;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -109,7 +109,7 @@ function checkShape(raw: Readonly<Record<string, unknown>>, input: V2OpenInput):
 }
 
 /** The canonical binding the AES-GCM tag authenticates. Keys are sorted by `stableJson`. */
-function bindingJson(raw: Readonly<Record<string, unknown>>): string {
+export function bindingJson(raw: Readonly<Record<string, unknown>>): string {
   const identity = envelopeIdentity(raw);
   return stableJson({
     version: V2_VERSION,
