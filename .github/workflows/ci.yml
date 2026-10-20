@@ -34,7 +34,9 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Pack the SDK tarball
-        run: npm pack --workspace packages/sdk --pack-destination "$RUNNER_TEMP/pack"
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --workspace packages/sdk --pack-destination "$RUNNER_TEMP/pack"
       - name: Scaffold a fresh backend
         run: |
           set -euo pipefail
