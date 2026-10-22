@@ -61,7 +61,17 @@ const ROUTE_NOT_RECOGNIZED = "This Network Storage route is not recognized. All 
 const STORAGE_NEEDS_PROJECT = "Network Storage v3 endpoints require a project id.";
 
 // Capabilities this server implements. Add a name only when its behaviour is complete.
-const SERVER_CAPABILITIES = ["library-error-envelope", "management-sync-jobs"] as const;
+const SERVER_CAPABILITIES = [
+  "records",
+  "global-records",
+  "endpoints",
+  "queries",
+  "game-values",
+  "rate-limits",
+  "auth-sessions",
+  "library-error-envelope",
+  "management-sync-jobs",
+] as const;
 
 async function route(ctx: ServerContext, request: Request): Promise<Response> {
   const url = new URL(request.url);
