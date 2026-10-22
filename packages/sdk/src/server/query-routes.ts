@@ -18,10 +18,12 @@ export interface QueryDefinition {
   readonly field: string | null;
   readonly order: "asc" | "desc";
   readonly limit: number;
+  readonly ttlSeconds: number;
 }
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 1000;
+const DEFAULT_TTL_SECONDS = 300;
 
 // Validates one editor query record. Throws a plain Error with the reason; the caller decides how to report it.
 export function parseQuery(value: unknown): QueryDefinition {
@@ -42,6 +44,8 @@ export function parseQuery(value: unknown): QueryDefinition {
     typeof configuredLimit === "number" && configuredLimit >= 1
       ? Math.min(Math.floor(configuredLimit), MAX_LIMIT)
       : DEFAULT_LIMIT;
+  const cache = isRecord(value["cache"]) ? value["cache"] : {};
+  const ttl = cache["ttlSeconds"];
   return {
     id,
     name: typeof value["name"] === "string" && value["name"] !== "" ? value["name"] : id,
@@ -51,6 +55,7 @@ export function parseQuery(value: unknown): QueryDefinition {
     field,
     order: config["order"] === "asc" ? "asc" : "desc",
     limit,
+    ttlSeconds: typeof ttl === "number" && Number.isInteger(ttl) ? ttl : DEFAULT_TTL_SECONDS,
   };
 }
 
@@ -78,43 +83,64 @@ export async function handleQuery(
     return jsonResponse({ error: { code: "NOT_FOUND", message: "Query not found." } }, 404);
   }
   if (query.requiresSecretKey && !access.hasSecretKey) {
-    throw new ProtocolError(
+    return jsonResponse(
+      {
+        error: {
+          code: "SECRET_KEY_REQUIRED",
+          message: "This query requires a Network Storage secret key. Send it in the x-secret-key header.",
+        },
+      },
       401,
-      "SECRET_KEY_REQUIRED",
-      "This query requires a Network Storage secret key. Send it in the x-secret-key header.",
     );
   }
-  const generatedAt = new Date(ctx.now()).toISOString();
-  const rows = ctx.catalog.collections.has(query.collectionId)
-    ? await ctx.storage().records.list(query.collectionId)
-    : [];
-  if (query.type === "count") {
-    return jsonResponse({
+  const startedMs = ctx.now();
+  const generatedAt = new Date(startedMs).toISOString();
+  const declared = ctx.catalog.collections.has(query.collectionId);
+  const rows = declared ? await ctx.storage().records.list(query.collectionId) : [];
+  const result = query.type === "count" ? { type: "count", count: rows.length } : leaderboardResult(query, rows);
+  const performance = {
+    at: generatedAt,
+    computedErrors: null,
+    computedFields: null,
+    durationMs: ctx.now() - startedMs,
+    keysScanned: rows.length,
+    sources: declared
+      ? [{ alias: query.collectionId, collectionId: query.collectionId, keysScanned: rows.length, name: query.collectionId, source: "store" }]
+      : [],
+  };
+  return jsonResponse(
+    {
       ok: true,
+      query: query.name,
       queryId,
-      type: "count",
-      columns: ["count"],
-      entries: [{ count: rows.length }],
-      count: rows.length,
+      queryName: query.name,
       generatedAt,
       lastran: generatedAt,
-    });
-  }
+      ttl: query.ttlSeconds,
+      updatedAt: generatedAt,
+      ...result,
+      performance,
+    },
+    200,
+    { "cache-control": "no-store, max-age=0" },
+  );
+}
+
+// Ranks rows by the query field. Entries carry the whole row and no output values. The SDK's query definitions
+// declare no output columns, so outputFields and columns stay empty, as the reference reports them for such queries.
+function leaderboardResult(query: QueryDefinition, rows: readonly { key: string; data: RecordData }[]): Record<string, unknown> {
   const field = query.field ?? "";
   const ranked = rows
-    .map((row) => ({ key: row.key, value: numberAt(row.data, field) }))
-    .filter((row): row is { key: string; value: number } => row.value !== null)
+    .map((row) => ({ key: row.key, data: row.data, value: numberAt(row.data, field) }))
+    .filter((row): row is { key: string; data: RecordData; value: number } => row.value !== null)
     .sort((a, b) => (query.order === "asc" ? a.value - b.value : b.value - a.value))
     .slice(0, query.limit);
-  return jsonResponse({
-    ok: true,
-    queryId,
+  return {
     type: "leaderboard",
     field,
     fieldLabel: field,
-    columns: ["rank", "key", "value"],
-    entries: ranked.map((row, index) => ({ rank: index + 1, key: row.key, value: row.value })),
-    generatedAt,
-    lastran: generatedAt,
-  });
+    outputFields: [],
+    columns: [],
+    entries: ranked.map((row, index) => ({ rank: index + 1, key: row.key, value: row.value, data: row.data, outputValues: {} })),
+  };
 }
