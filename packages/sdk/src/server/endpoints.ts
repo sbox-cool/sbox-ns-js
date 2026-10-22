@@ -270,7 +270,7 @@ function resolveSlug(pathSlug: string | null, body: Readonly<Record<string, unkn
     ? nonEmpty(body === null ? undefined : body.endpointSlug)
     : nonEmpty(body?._endpointSlug) ?? nonEmpty(body?.endpoint);
   if (pathSlug === null) {
-    if (claim === null) throw new ProtocolError(400, "ENDPOINT_SLUG_REQUIRED", "The endpoint name is required.");
+    if (claim === null) throw new ProtocolError(400, "INVALID_REQUEST", "Missing endpoint slug.");
     return claim;
   }
   if (claim !== null && claim !== pathSlug && !encrypted) {
