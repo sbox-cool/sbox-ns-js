@@ -61,6 +61,7 @@ export interface Config {
   sessionSecret: string;
   signingPrivateKeyPem: string;
   dataFile: string;
+  requestKeysFile: string;
   definitionsDir: string;
   fetchAllowedHosts: readonly string[];
   host: string;
@@ -93,6 +94,7 @@ export function loadConfig(env: Env, root: string): Config {
     sessionSecret: required("SESSION_SECRET"),
     signingPrivateKeyPem: readFileSync(resolve(root, env["SIGNING_KEY_FILE"] ?? "keys/signing-private.pem"), "utf8"),
     dataFile: resolve(root, env["DATA_FILE"] ?? "data/sbox-ns.sqlite"),
+    requestKeysFile: resolve(root, env["REQUEST_KEYS_FILE"] ?? "data/request_encryption_keys.json"),
     definitionsDir: resolve(root, env["DEFINITIONS_DIR"] ?? "Editor/Network Storage"),
     fetchAllowedHosts: splitList(env["FETCH_ALLOWED_HOSTS"]),
     host: env["HOST"] ?? "0.0.0.0",
@@ -237,7 +239,7 @@ import { createNetworkStorageServer, type NetworkStorageServer, type ServerOptio
 import { parse } from "yaml";
 import type { Config } from "./config.js";
 import { endpoints } from "./endpoints.js";
-import { nodeFetchPolicy } from "@sbox-ns/sdk/node";
+import { ensureRequestKeyRing, nodeFetchPolicy } from "@sbox-ns/sdk/node";
 import { globals } from "./globals.js";
 import { modules } from "./modules.js";
 import { openStorage } from "./storage.js";
@@ -256,6 +258,7 @@ export async function buildOptions(config: Config): Promise<ServerOptions> {
     ownerUserId: 1,
     settings: { enableAuthSessions: false, requireAuthSessions: false, encryptedRequestMode: "off" },
     signingPrivateKeyPem: config.signingPrivateKeyPem,
+    requestKeys: await ensureRequestKeyRing(config.requestKeysFile),
     sessionSecret: config.sessionSecret,
     endpoints,
     globals,
@@ -342,7 +345,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 
 const APP_TEST_TS = `import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -370,6 +373,7 @@ function testConfig(dir: string): Config {
     sessionSecret: "test-session-secret",
     signingPrivateKeyPem: privateKey,
     dataFile: join(dir, "sbox-ns.sqlite"),
+    requestKeysFile: join(dir, "request_encryption_keys.json"),
     definitionsDir: join(PROJECT_ROOT, "Editor", "Network Storage"),
     fetchAllowedHosts: [],
     host: "127.0.0.1",
@@ -449,6 +453,20 @@ test("installModules is idempotent on a hosted project", async () => {
     const second = await installModules(client, [economy]);
     assert.equal(first.modules[0]?.status, "installed");
     assert.equal(second.modules[0]?.status, "unchanged");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the request key ring is created once and reused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sbox-ns-keys-"));
+  try {
+    const config = testConfig(dir);
+    const first = await buildOptions(config);
+    const second = await buildOptions(config);
+    assert.ok(first.requestKeys?.currentKeyId);
+    assert.equal(second.requestKeys?.currentKeyId, first.requestKeys?.currentKeyId);
+    if (process.platform !== "win32") assert.equal(statSync(config.requestKeysFile).mode & 0o777, 0o600);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -618,7 +636,7 @@ Check it answers: \`curl http://localhost:${port}/v1/endpoints/<PROJECT_ID>/ping
 - \`src/endpoints.ts\`, \`src/globals.ts\`: code endpoints and shared helpers.
 - \`src/modules.ts\`: catalog modules (economy, inventory, progression, leaderboards) wired in-process by \`withModules\`.
 - \`src/app.ts\`: builds the server. \`src/server.ts\`: HTTP listener, dev sync.
-- \`.env\`: secrets and settings. \`keys/\`: signing key. \`data/\`: SQLite database.
+- \`.env\`: secrets and settings. \`keys/\`: signing key. \`data/\`: SQLite database and \`request_encryption_keys.json\`, the RSA request key for v2 encrypted requests. The server creates that file, owner-only, on first start and never overwrites it.
 
 ## Test
 
@@ -639,7 +657,7 @@ sudo cp deploy/sbox-ns.service /etc/systemd/system/
 sudo systemctl enable --now sbox-ns
 \`\`\`
 
-Create the \`sboxns\` user first, and keep \`.env\` and \`keys/\` readable only by that user.
+Create the \`sboxns\` user first, and keep \`.env\`, \`keys/\`, and \`data/\` readable only by that user.
 
 ### Docker
 
@@ -649,7 +667,7 @@ docker run -d -p ${port}:${port} --env-file .env \\
   -v "$PWD/keys:/app/keys:ro" -v "$PWD/data:/app/data" sbox-ns-backend
 \`\`\`
 
-The image runs \`bun run src/server.ts\`. Mount \`keys/\` and \`data/\`; do not bake them into the image.
+The image runs \`bun run src/server.ts\`. Mount \`keys/\` and \`data/\`; do not bake them into the image. \`data/\` holds the request key ring, so keep it on persistent storage: a new key makes encrypted clients re-fetch the signed config.
 
 ### Cloudflare Workers
 

@@ -19,6 +19,7 @@ Output:
 - `configure.txt` and the README contain the `NetworkStorage.Configure( "<project>", "<public key>", "<url>" );` line for the game. Only the public key appears there.
 - `.env` (mode 0600) holds the secret key, the session secret, and the paths. Never put the secret key in game code.
 - `keys/signing-private.pem` (mode 0600) is an RSA 2048 signing key, generated locally.
+- `data/request_encryption_keys.json` is not written by the generator. The backend creates it (mode 0600) on first start, holding the RSA request key for v2 encrypted requests.
 
 Requirements: Node 20+ to run the generator. The generated project needs Bun 1.1+ or Node 22.13+ (for `node:sqlite`).
 
