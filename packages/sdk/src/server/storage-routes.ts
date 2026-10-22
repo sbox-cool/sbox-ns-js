@@ -10,6 +10,7 @@ import { BODY_NOT_OBJECT, credentialsOf, pathSegment, readJsonBody, readJsonValu
 import { KeyRefusal } from "./auth-failure.js";
 import { handleQuery } from "./query-routes.js";
 import { LEDGER_COLLECTION, ledgerSummaryOf } from "../endpoint/ledger.js";
+import { PROFILES_COLLECTION } from "./catalog.js";
 
 // Direct record access (/storage/{project}/{collection}/{key}) and the runtime families built on the same storage.
 // Secret-key callers bypass the document rules. Everything else is checked here, before storage is touched.
@@ -197,8 +198,8 @@ async function readDocument(
   return jsonResponse(record);
 }
 
-// The ledger rows for one player's _ledger fields, oldest first. A key with no record and no ledger rows is missing.
-// The SDK has no separate player profile, so the record alone marks a player known.
+// The ledger rows for one player's _ledger fields, oldest first. A key with no record, no ledger rows, and no player
+// marker is missing. The marker is written by endpoint calls and survives record deletes, as the reference profile does.
 async function readLedger(
   ctx: ServerContext,
   request: Request,
@@ -214,10 +215,13 @@ async function readLedger(
     .map((row) => row.data)
     .filter((row) => row["collection_id"] === collectionId && row["steam_id"] === steamId)
     .sort((a, b) => String(a["ts"]).localeCompare(String(b["ts"])));
-  // Reference rule: a missing key has no ledger rows, no record, and no player profile. The stats row stands in for the profile.
+  // Reference rule: a missing key has no ledger rows, no record, and no player profile. The _stats row and the
+  // _profiles marker both stand in for the profile.
   if (entries.length === 0) {
     const record = definition === undefined ? null : await storage.records.get(collectionId, steamId);
-    if (record === null && (await storage.records.get("_stats", steamId)) === null) return keyNotFound();
+    if (record === null && (await storage.records.get("_stats", steamId)) === null && (await storage.records.get(PROFILES_COLLECTION, steamId)) === null) {
+      return keyNotFound();
+    }
   }
   return jsonResponse({
     steamId,

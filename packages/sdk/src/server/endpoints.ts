@@ -1,6 +1,6 @@
 import { DslResponse } from "../dsl/steps.js";
 import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
-import { trackedFieldsOf, type Catalog } from "./catalog.js";
+import { PROFILES_COLLECTION, trackedFieldsOf, type Catalog } from "./catalog.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { openV1Envelope } from "../protocol/envelope-v1.js";
 import { openV2Envelope, sealV2Response, type V2ResponseKey } from "../protocol/envelope-v2.js";
@@ -83,6 +83,8 @@ export async function handleEndpoint(
   if (access === null) throw new KeyRefusal();
   const state: CallState = { library: false, requestId: null, responseKey: null };
   try {
+    // Headers alone decide library status until the body is read, so an oversized body still gets the envelope.
+    state.library = isLibraryCaller(request.headers, null);
     const body = request.method === "GET" ? null : await endpointBody(request);
     state.library = isLibraryCaller(request.headers, body);
     return await runCall(ctx, request, url, pathSlug, body, access.hasSecretKey, state);
@@ -290,9 +292,24 @@ export async function executeEndpoint(
   if (call.live && outcome.writes.length > 0) {
     await view.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
   }
+  if (call.live && call.steamId !== null) await markPlayerKnown(view, call.steamId);
   // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.
   const response = outcome.value instanceof DslResponse ? outcome.value : null;
   return { status: response?.status ?? 200, body: successBody(response === null ? outcome.value : response.body) };
+}
+
+// The reference upserts the caller's profile on every endpoint call. The marker is that profile here: it survives
+// record deletes. Best-effort, like the reference: a raced or failed marker never fails the call.
+async function markPlayerKnown(view: RuntimeView, steamId: string): Promise<void> {
+  try {
+    if ((await view.storage.records.get(PROFILES_COLLECTION, steamId)) !== null) return;
+    await view.storage.apply(
+      [{ op: "put", collection: PROFILES_COLLECTION, key: steamId, data: { steam_id: steamId } }],
+      { expectedVersions: [{ collection: PROFILES_COLLECTION, key: steamId, version: 0 }] },
+    );
+  } catch {
+    // Another call created the marker first, or the write failed; neither fails the endpoint call.
+  }
 }
 
 // The route slug, or the one the body claims for a plain call. Encrypted bodies claim it inside the envelope,

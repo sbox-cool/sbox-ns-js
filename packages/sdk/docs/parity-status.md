@@ -59,7 +59,7 @@ Only genuinely unmatchable items belong here. Without these two entries, the dif
 
 ## Intentional steps
 
-The 15 intentional steps differ from the reference, and the allow-lists accept those differences. Thirteen are covered by the reference allow-list. Two are covered by the SDK allow-list above (`preflight-invalid`, `deploy-canary`).
+The 12 intentional steps differ from the reference, and the allow-lists accept those differences. Ten are covered by the reference allow-list. Two are covered by the SDK allow-list above (`preflight-invalid`, `deploy-canary`). The table is from before the latest changes; regenerate it from a fresh run.
 
 | Family | Scenario / step | Covered by | Differing paths (stable vs candidate) |
 | --- | --- | --- | --- |
@@ -68,11 +68,8 @@ The 15 intentional steps differ from the reference, and the allow-lists accept t
 | 01 | manage-queries / list, list-after-delete | reference | Reference reports `config` and `sources` per query. SDK reports flat `field`, `limit`, `order`, `ttlSeconds`, `collectionId`. |
 | 01 | manage-package-and-revision / revision-init, revision-init-outdated | reference | Reference reports `latestRevisionId`, `playerRevision`, `revisionOutdated`, `message`. SDK reports `revisionId`, `projectId`, `outdated`. |
 | 01 | manage-tests-and-tools / put-tests | reference | Reference reports `action`, `resourceKind`, `source`, `total`. SDK reports `count`. |
-| 01 | manage-tests-and-tools / source-upgrade | reference | `capabilities.supportedFeatures` order and members differ (reference lists `goto`, `run`, `return`, `legacy-onFail` at the end). |
 | 01 | manage-push-all / preflight-invalid | SDK | YAML parser wording (see above). |
 | 03 | endpoints-player-flow / buy-drill-unaffordable | reference | A failing condition step: the SDK adds `error.docsUrl` and `error.step`, and omits `conditionRejection`, `flagged`, `severity`, `fireWebhook`. |
-| 06 | ledger-read / ledger | reference | Reference returns `200` with an empty ledger. SDK returns `404 NOT_FOUND`. |
-| 10 | errors-oversized-payloads / endpoint-oversized | reference | Reference returns `200`; SDK returns `413`. |
 | 10 | errors-invalid-input / deploy-canary | SDK | Owner identity (see above). |
 
-Several reference-covered differences are behavioral, not cosmetic (for example the ledger `404` and the endpoint-oversized status). They stay here because the reference allow-list covers them. Main should review them if the goal tightens beyond the allow-list.
+Several reference-covered differences are behavioral, not cosmetic (for example the buy-drill condition rejection shape). They stay here because the reference allow-list covers them. Main should review them if the goal tightens beyond the allow-list.
