@@ -141,6 +141,11 @@ function securityConfigMissing(projectId: string): Response {
       source: "missing",
     },
     404,
+    {
+      "cache-control": "public, max-age=15, s-maxage=60",
+      "x-security-config-cache": "public",
+      "x-security-config-source": "missing",
+    },
   );
 }
 

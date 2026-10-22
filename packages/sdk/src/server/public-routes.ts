@@ -5,11 +5,19 @@ import { publicValuesOf } from "./catalog.js";
 import { targetsNext } from "./publish-target.js";
 import { safeEqual } from "./http.js";
 
-// GET /{v}/security-config/{project}. Public: the game fetches it before it has any secret.
+// GET /{v}/security-config/{project}. Public: the game fetches it before it has any secret. The reference wraps the
+// signed config under `config`, marks its source, and caches it unless `refresh=1` bypasses the cache.
 export async function handleSecurityConfig(ctx: ServerContext, url: URL): Promise<Response> {
   const refresh = url.searchParams.get("refresh") === "1";
   const config = await ctx.config.current(ctx.now(), refresh);
-  return jsonResponse(config, 200);
+  const cacheHeaders = refresh
+    ? { "cache-control": "no-store, max-age=0", "x-security-config-cache": "bypass" }
+    : { "cache-control": "public, max-age=15, s-maxage=60", "x-security-config-cache": "public" };
+  return jsonResponse({ config, ok: true, source: "store" }, 200, {
+    ...cacheHeaders,
+    "x-security-config-source": "store",
+    "x-security-config-version": config.configVersion,
+  });
 }
 
 // GET /{v}/values/{project}. Needs the public key, so game values are not handed to anonymous callers.

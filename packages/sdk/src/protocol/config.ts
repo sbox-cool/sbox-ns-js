@@ -16,8 +16,13 @@ export const V2_ALGORITHM = "rsa-oaep-256+aes-256-gcm";
 export interface SecuritySettings extends SecurityProject {
   authSessionTtlSeconds?: number;
   encryptedRequestWindowSeconds?: number;
-  /** The SDK does not ingest analytics, so this defaults to disabled. */
-  analytics?: { enabled: boolean; allowedEventTypes?: readonly string[] };
+  /** Defaults to enabled, matching the reference. Accepted analytics events are stored in `_analytics`. */
+  analytics?: { enabled?: boolean; allowedEventTypes?: readonly string[] };
+  /**
+   * Reference `legacyPlayerProjections`: when true, endpoint writes to `_ledger` number fields append
+   * ledger rows. Off for new projects, so the ledger route is empty until a project opts in.
+   */
+  legacyPlayerProjections?: boolean;
 }
 
 export interface SecurityConfigInput {
@@ -63,14 +68,13 @@ export interface SignedSecurityConfig {
 /** The settings object the config version hashes and the config publishes. Mirrors `NetworkStorageSecurityConfigBuilder.SettingsOf`. */
 export function securitySettingsDocument(settings: SecuritySettings): Record<string, unknown> {
   const mode: EncryptedRequestMode = settings.encryptedRequestMode;
-  const analytics = settings.analytics ?? { enabled: false };
+  const analytics = settings.analytics ?? {};
   const document: Record<string, unknown> = {
     enableAuthSessions: settings.enableAuthSessions,
     authSessionTtlSeconds: normalizeSessionTtl(settings.authSessionTtlSeconds ?? DEFAULT_SESSION_TTL_SECONDS),
     enableEncryptedRequests: mode !== "off",
     encryptedRequestWindowSeconds: clampReplayWindow(settings.encryptedRequestWindowSeconds),
     analytics: {
-      enabled: analytics.enabled,
       allowedEventTypes: [...(analytics.allowedEventTypes ?? DEFAULT_ANALYTICS_EVENT_TYPES)],
     },
   };
@@ -98,7 +102,7 @@ export async function buildSecurityConfig(input: SecurityConfigInput): Promise<S
     modes: {
       authSessions: settings.enableAuthSessions ? "enabled" : "disabled",
       encryptedRequests: settings.encryptedRequestMode === "off" ? "disabled" : "required",
-      analytics: settings.analytics?.enabled ? "enabled" : "disabled",
+      analytics: (settings.analytics?.enabled ?? true) ? "enabled" : "disabled",
     },
     settings: securitySettingsDocument(settings),
     signing: {
