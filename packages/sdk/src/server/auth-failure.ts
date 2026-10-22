@@ -1,5 +1,5 @@
 import { isLibraryCaller, libraryErrorBody } from "../protocol/library.js";
-import { jsonResponse } from "../util/http.js";
+import { jsonResponse, traceIdentifier } from "../util/http.js";
 import { errorResponse } from "./http.js";
 
 // Thrown by any route family whose key check failed. The top-level dispatcher renders it in the envelope of the
@@ -57,7 +57,7 @@ export async function keyFailureResponse(family: KeyFamily, request: Request, ur
         return errorResponse({ status: 401, code: "UNAUTHORIZED", message });
       }
       return jsonResponse(
-        libraryErrorBody({ status: 401, code: "UNAUTHORIZED", message, requestId: crypto.randomUUID() }),
+        libraryErrorBody({ status: 401, code: "UNAUTHORIZED", message, requestId: traceIdentifier() }),
         200,
       );
     }
