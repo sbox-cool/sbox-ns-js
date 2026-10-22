@@ -71,11 +71,12 @@ The corpus does not measure these. They are listed so they are not mistaken for 
 
 Run 39764111378 on windows-latest (sbox-ns-js `a0a2516`, sbox-network-storage-server `976cff7`, sbox-public `468c55e8`, dedicated server built from source) passed for `main` and `r427072`: library load, HTTP allowed, endpoint call, endpoint call with input, game values, secret-key endpoint, encrypted calls, and plain/encrypted switching through `PUT /v3/manage/{project}/settings`. Both refs resolved to library commit `ddf9b617`, the r427072 tag, so this is one library revision run twice. The result is `ci-only`. No native editor pass is claimed.
 
+Run 39767697019 on windows-latest (sbox-ns-js `0a585ff`, sbox-network-storage-server `d2c321c` with the harness at main, sbox-public `468c55e8`, dedicated server built from source) passed for `main` and `r427072`. The backend is a fresh `create-sbox-ns-backend` project, which creates `data/request_encryption_keys.json` on first start, so the SDK accepts v2 modes. Both libraries pass every v2 check: v2-required saved and the signed config requiring v2, the v2 echo and no-input calls, a changed signing-key pin refused with `ENCRYPTION_KEY_PIN_MISMATCH` and then recovered, and v2 to v1 and v1 to v2 switching through the library's `SECURITY_*` retry. The r427072 v1 on/off rows are marked informational in its summary; `main` marks them as checks. The result is `ci-only`. No native editor pass is claimed.
+
 Not covered by that run:
 
 - Sessions (session login and session-bound calls). The dedicated driver has no session step.
 - Host-proxy with a second account.
-- v2 encrypted modes. The SDK refuses them without a request key, and the run does not exercise them.
 - Rate limit. A `--server-url` server cannot be restarted with a low limit.
 - Encryption 409 rows. An attached server's request log is not reachable from the harness.
 - Key rotation in attached mode.
