@@ -74,7 +74,21 @@
     "access": "public",
     "provenance": true
   },
+  "peerDependencies": {
+    "quickjs-emscripten": "^0.32.0",
+    "sucrase": "^3.35.1"
+  },
+  "peerDependenciesMeta": {
+    "quickjs-emscripten": {
+      "optional": true
+    },
+    "sucrase": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "quickjs-emscripten": "^0.32.0",
+    "sucrase": "^3.35.1",
     "yaml": "^2.9.1"
   }
 }

@@ -15,6 +15,7 @@ import {
   storedRecordOf,
   upsertGameValues,
   writeCompiled,
+  scriptGraphFault,
   type Compiled,
   type EndpointEntry,
   type RecordCheck,
@@ -103,11 +104,15 @@ function compileSection(ctx: ServerContext, kind: ResourceKind, value: unknown):
   }
   const items = value.map((raw, slot) => ({ slot, raw, check: checkRecord(kind, raw, ctx.options.parseYaml) }));
   const faults = items.flatMap((item) => (item.check.ok ? [] : [item.check.fault]));
+  const compiled = items.flatMap((item) => (item.check.ok ? [item.check.item] : []));
+  // Cross-document script checks run once every record compiles, over the catalog with this section applied.
+  const graph = faults.length === 0 && kind === "endpoints" ? scriptGraphFault(ctx.catalog, compiled) : null;
+  if (graph !== null) faults.push({ stage: "definition", code: graph.code, message: graph.message, sourcePath: null, suggestedFix: null });
   return {
     kind,
     shapeError: null,
     items,
-    compiled: items.flatMap((item) => (item.check.ok ? [item.check.item] : [])),
+    compiled,
     ok: faults.length === 0,
     message: faults[0]?.message ?? null,
   };

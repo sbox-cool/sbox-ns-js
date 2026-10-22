@@ -1,4 +1,4 @@
-import { compileBatch, documentOf, removeEndpoints, writeCompiled, type Catalog, type Compiled, type RecordResult } from "./catalog.js";
+import { compileBatch, documentOf, removeEndpoints, scriptGraphFault, writeCompiled, type Catalog, type Compiled, type RecordResult } from "./catalog.js";
 import type { ServerContext } from "./context.js";
 import type { PublishDecision } from "./publish-target.js";
 
@@ -237,6 +237,11 @@ async function runEndpointSync(
         .filter((result: RecordResult) => !result.ok)
         .map((result: RecordResult) => failedRow(result.id, result.message ?? "The definition is invalid."));
       failJob(ctx, jobId, stage, "SYNC_FAILED", "Endpoint save failed.", failed);
+      return;
+    }
+    const graph = scriptGraphFault(ctx.catalog, batch.compiled);
+    if (graph !== null) {
+      failJob(ctx, jobId, stage, graph.code, "One or more endpoints failed validation.", [failedRow("", graph.message)]);
       return;
     }
     stage = "saving";

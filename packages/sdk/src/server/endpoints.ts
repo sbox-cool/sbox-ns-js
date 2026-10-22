@@ -1,5 +1,5 @@
 import { DslResponse } from "../dsl/steps.js";
-import { runEndpoint, type SecretStore } from "../endpoint/runtime.js";
+import { runEndpoint, ScriptFailure, type SecretStore } from "../endpoint/runtime.js";
 import { PROFILES_COLLECTION, trackedFieldsOf, type Catalog } from "./catalog.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { openV1Envelope } from "../protocol/envelope-v1.js";
@@ -8,7 +8,6 @@ import { readField } from "../protocol/fields.js";
 import { clampReplayWindow, consumeRequestId } from "../protocol/replay.js";
 import { claimedSteamId, readSessionToken, resolvePlayer } from "../protocol/identity.js";
 import { isLibraryCaller, libraryErrorBody } from "../protocol/library.js";
-import { withoutReservedKeys } from "../protocol/payload.js";
 import { envelopeKindOf, securityDenial, type EnvelopeKind } from "../protocol/security.js";
 import { verifyAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
@@ -18,31 +17,51 @@ import { KeyRefusal } from "./auth-failure.js";
 import { targetsNext } from "./publish-target.js";
 import { credentialsOf, describeError, describedErrorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
-import type { EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
+import type { EndpointHandler, ScriptModule, ScriptRunner, WorkflowFunction } from "../endpoint/types.js";
 import type { ExecutionMode } from "../endpoint/execution.js";
+import { aliasTable } from "../script/aliases.js";
+import { loadScriptSandbox, ScriptEngineMissing } from "../script/load.js";
+import { createScriptRunner } from "../script/sandbox.js";
 
-// Keys that address the call rather than carry input. They never reach the handler.
-const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
+// Query keys that carry auth or identity and never reach GET endpoint input. Matched case-insensitively, as the server does.
+const RESERVED_QUERY_KEYS: Record<string, true> = {
+  apikey: true,
+  steamid: true,
+  token: true,
+  authsessiontoken: true,
+  sessiontoken: true,
+  encryptedrequestid: true,
+  secretkey: true,
+  networkstoragesecret: true,
+  network_storage_secret_key: true,
+};
+
+// Routing fields removed from POST input. `_endpointSlug` is removed only when the body supplied the slug.
+const ROUTING_KEYS = ["endpoint", "slug"] as const;
 
 // No secrets are configured, so every name is absent. Handlers get null, never a value from elsewhere.
 const NO_SECRETS: SecretStore = { get: () => null };
+
+// The largest JSON body a script endpoint may return (the server's response limit).
+const SCRIPT_RESPONSE_LIMIT_BYTES = 256 * 1024;
 
 // Static endpoints from ServerOptions first, then the endpoints the editor pushed (compiled from DSL documents).
 export function resolveEndpoint(
   ctx: ServerContext,
   catalog: Catalog,
   slug: string,
-): { handler: EndpointHandler; requiresSecretKey: boolean; execution: ExecutionMode } | null {
+): { handler: EndpointHandler; requiresSecretKey: boolean; execution: ExecutionMode; script: ScriptModule | null } | null {
   if (Object.hasOwn(ctx.options.endpoints, slug)) {
-    return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false, execution: "scripted" };
+    return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false, execution: "scripted", script: null };
   }
   const entry = catalog.endpoints.get(slug);
   // Internal endpoints are not served over HTTP. The reference answers them as not found.
-  if (entry === undefined || !entry.enabled || entry.compiled.exposure === "internal") return null;
+  if (entry === undefined || !entry.enabled || entry.compiled.exposure === "internal" || entry.compiled.scope === "global") return null;
   return {
     handler: entry.compiled.handler,
     requiresSecretKey: entry.compiled.requiresSecretKey,
-    execution: "declarative",
+    script: entry.compiled.script?.module ?? null,
+    execution: entry.compiled.script === null ? "declarative" : "scripted",
   };
 }
 
@@ -226,9 +245,7 @@ async function runCall(
   }
 
   const input =
-    request.method === "GET"
-      ? withoutReservedKeys(omitKeys(Object.fromEntries(url.searchParams), SHELL_KEYS))
-      : withoutReservedKeys(omitKeys(commandBody ?? {}, SHELL_KEYS));
+    request.method === "GET" ? queryInput(url) : bodyInput(commandBody, pathSlug !== null);
 
   const run = await executeEndpoint(ctx, view, target, {
     slug,
@@ -255,17 +272,55 @@ export interface EndpointCall {
 
 export interface EndpointRun {
   readonly status: number;
-  readonly body: Record<string, unknown>;
+  readonly body: unknown;
+}
+
+// The modules a script endpoint can import, and the names it reads them under: each enabled global endpoint by its id and
+// by its camelCase alias. A disabled global is not visible to scripts.
+function scriptGlobalsOf(catalog: Catalog): { modules: ScriptModule[]; names: Map<string, string> } {
+  const modules: ScriptModule[] = [];
+  const ids: string[] = [];
+  for (const entry of catalog.endpoints.values()) {
+    if (!entry.enabled || entry.compiled.scope !== "global" || entry.compiled.script === null) continue;
+    modules.push(entry.compiled.script.module);
+    ids.push(entry.compiled.id);
+  }
+  const names = new Map(ids.map((id) => [id, id] as const));
+  for (const [alias, id] of aliasTable(ids)) {
+    if (!names.has(alias)) names.set(alias, id);
+  }
+  return { modules, names };
+}
+
+// The runner for one call. Its time budget is shared by every pass of the call. A missing engine is a typed 500.
+async function scriptRunnerOf(ctx: ServerContext, catalog: Catalog): Promise<ScriptRunner> {
+  try {
+    await loadScriptSandbox();
+  } catch (error) {
+    if (error instanceof ScriptEngineMissing) throw new ScriptFailure("SCRIPT_ENGINE_MISSING", error.message, 500);
+    throw error;
+  }
+  const globals = scriptGlobalsOf(catalog);
+  const workflowIds = [...Object.keys(ctx.options.workflows ?? {}), ...catalog.workflows.keys()];
+  return createScriptRunner({
+    globals: globals.modules,
+    globalNames: globals.names,
+    workflowNames: aliasTable(workflowIds),
+    budget: { spentMs: 0 },
+  });
 }
 
 // Runs a resolved endpoint in process and applies its writes. Returns the status and success body the endpoint declares.
 export async function executeEndpoint(
   ctx: ServerContext,
   view: RuntimeView,
-  target: { readonly handler: EndpointHandler; readonly execution: ExecutionMode },
+  target: { readonly handler: EndpointHandler; readonly execution: ExecutionMode; readonly script: ScriptModule | null },
   call: EndpointCall,
 ): Promise<EndpointRun> {
   const { options } = ctx;
+  const scripts = target.script === null ? undefined : await scriptRunnerOf(ctx, view.catalog);
+  // Each secret a run reads is remembered, so the response and the writes can be checked for its value.
+  const readSecrets = new Map<string, string>();
   const outcome = await runEndpoint(
     target.handler,
     {
@@ -281,21 +336,34 @@ export async function executeEndpoint(
       fetchPolicy: options.fetchPolicy,
       workflows: workflowsOf(ctx, view.catalog),
       globals: options.globals ?? {},
-      secrets: options.secrets ?? NO_SECRETS,
+      secrets: recordingSecrets(options.secrets ?? NO_SECRETS, readSecrets),
       now: ctx.now,
       trackedFields: (collection) =>
         ctx.settings().security.legacyPlayerProjections === true ? trackedFieldsOf(view.catalog, collection) : [],
       log: options.log ?? (() => undefined),
       signal: call.signal,
+      scripts,
     },
-  );
+  ).catch((error: unknown) => {
+    throw target.script === null ? error : publicScriptError(error);
+  });
+  // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.
+  const response = outcome.value instanceof DslResponse ? outcome.value : null;
+  const shown = redactSecrets(response === null ? outcome.value : response.body, readSecrets);
+  // A script's return is its response as is. A declarative endpoint's success body carries `ok`.
+  const body = target.script === null ? successBody(shown) : shown;
+  if (target.script !== null && writesHoldSecret(outcome.writes, readSecrets)) {
+    throw new ScriptFailure("SECRET_WRITE_FORBIDDEN", "Project secrets cannot be stored in records.", 400);
+  }
+  // A script's response is capped, and a rejected response never commits its writes.
+  if (target.script !== null && new TextEncoder().encode(JSON.stringify(body)).byteLength > SCRIPT_RESPONSE_LIMIT_BYTES) {
+    throw publicScriptError(new ScriptFailure("SCRIPT_LIMIT_EXCEEDED", "The endpoint exceeded a limit.", 500));
+  }
   if (call.live && outcome.writes.length > 0) {
     await view.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
   }
   if (call.live && call.steamId !== null) await markPlayerKnown(view, call.steamId);
-  // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.
-  const response = outcome.value instanceof DslResponse ? outcome.value : null;
-  return { status: response?.status ?? 200, body: successBody(response === null ? outcome.value : response.body) };
+  return { status: response?.status ?? 200, body };
 }
 
 // The reference upserts the caller's profile on every endpoint call. The marker is that profile here: it survives
@@ -370,9 +438,93 @@ function omitKeys(raw: Readonly<Record<string, unknown>>, keys: readonly string[
   return out;
 }
 
+// Mirrors the server's GET input: query string values minus reserved auth and identity keys.
+function queryInput(url: URL): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of url.searchParams) {
+    if (RESERVED_QUERY_KEYS[key.toLowerCase()] !== true) out[key] = value;
+  }
+  return out;
+}
+
+// Mirrors the server's POST input: the body, or its `input` / `args` object when present. Identity keys stay, since the server strips them only from encrypted payloads.
+function bodyInput(body: Readonly<Record<string, unknown>> | null, slugFromPath: boolean): Record<string, unknown> {
+  if (body === null) return {};
+  const source = isRecord(body.input) ? body.input : isRecord(body.args) ? body.args : body;
+  return omitKeys(source, slugFromPath ? ROUTING_KEYS : [...ROUTING_KEYS, "_endpointSlug"]);
+}
+
 // A handler may return any value. Objects keep their fields; anything else is returned under `result`.
 function successBody(value: unknown): Record<string, unknown> {
   if (value === undefined || value === null) return { ok: true };
   if (isRecord(value)) return { ...value, ok: true };
   return { ok: true, result: value };
+}
+
+// The server's message for a script's 5xx failure. It replaces the detail, so no internal text reaches the caller.
+const GENERIC_SCRIPT_FAILURE = "An internal Network Storage error occurred while executing this endpoint.";
+
+function publicScriptError(error: unknown): unknown {
+  if (!(error instanceof ScriptFailure) || error.status < 500) return error;
+  return new ScriptFailure(error.code, GENERIC_SCRIPT_FAILURE, error.status);
+}
+
+// Wraps the caller's secret store so every value a run reads is remembered under its name.
+function recordingSecrets(store: SecretStore, read: Map<string, string>): SecretStore {
+  return {
+    get(name) {
+      const found = store.get(name);
+      if (found instanceof Promise) return found.then((value) => rememberSecret(name, value, read));
+      return rememberSecret(name, found, read);
+    },
+  };
+}
+
+function rememberSecret(name: string, value: string | null, read: Map<string, string>): string | null {
+  if (value !== null && value !== "") read.set(name, value);
+  return value;
+}
+
+// Replaces each secret value a run read with `[secret:NAME]`, longest value first, in every string including keys.
+function redactSecrets(value: unknown, read: ReadonlyMap<string, string>): unknown {
+  if (read.size === 0) return value;
+  const pairs = [...read].sort(longestFirst);
+  return mapStrings(value, (text) => {
+    let out = text;
+    for (const [name, secret] of pairs) out = out.split(secret).join(`[secret:${name}]`);
+    return out;
+  });
+}
+
+// Whether any write carries a secret value a run read. The server rejects such a write rather than store it.
+function writesHoldSecret(writes: unknown, read: ReadonlyMap<string, string>): boolean {
+  if (read.size === 0) return false;
+  let found = false;
+  mapStrings(writes, (text) => {
+    for (const secret of read.values()) {
+      if (text.includes(secret)) found = true;
+    }
+    return text;
+  });
+  return found;
+}
+
+// Applies `fn` to every string of a JSON-like value: string leaves and object keys.
+function mapStrings(value: unknown, fn: (text: string) => string): unknown {
+  if (typeof value === "string") return fn(value);
+  if (Array.isArray(value)) {
+    const items: unknown[] = [];
+    for (const item of value) items.push(mapStrings(item, fn));
+    return items;
+  }
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) out[fn(key)] = mapStrings(item, fn);
+    return out;
+  }
+  return value;
+}
+
+function longestFirst(a: [string, string], b: [string, string]): number {
+  return b[1].length - a[1].length;
 }

@@ -1,4 +1,5 @@
 import type { EndpointStorage, ExpectedVersion, RecordData, RecordWrite, StoredRecord, VersionedRecord } from "../storage/index.js";
+import type { ScriptRunner } from "./types.js";
 import { isRecord } from "../util/guards.js";
 import { ledgerWritesOf } from "./ledger.js";
 import {
@@ -55,6 +56,8 @@ export interface RunEnvironment {
   fetchPolicy: FetchPolicy;
   workflows: Readonly<Record<string, WorkflowFunction>>;
   globals: Readonly<Record<string, Readonly<Record<string, EndpointGlobal>>>>;
+  // Runs scripted endpoints (one sandbox pass per call). Absent for DSL and in-process handlers.
+  scripts?: ScriptRunner;
   secrets: SecretStore;
   now: () => number;
   // Dotted paths of the number fields marked _ledger on a collection. Empty for collections that are not ledgered.
@@ -98,7 +101,7 @@ export async function runEndpoint(
     let value: unknown;
     let failure: { error: unknown } | null = null;
     try {
-      value = handler(request, pass.ns, { globals: env.globals });
+      value = handler(request, pass.ns, { globals: env.globals, scripts: env.scripts });
       if (isThenable(value)) {
         // The rejection is observed here, so it cannot surface as an unhandled promise rejection.
         Promise.resolve(value).catch(() => undefined);

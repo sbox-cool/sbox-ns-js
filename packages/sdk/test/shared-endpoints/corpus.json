@@ -1,0 +1,300 @@
+{
+  "collections": [
+    {
+      "id": "players",
+      "name": "players",
+      "description": "Per-player state for shared endpoint fixtures.",
+      "collectionType": "per-steamid",
+      "accessMode": "public",
+      "maxRecords": 1,
+      "allowRecordDelete": false,
+      "requireSaveVersion": false,
+      "rateLimitAction": "reject",
+      "rateLimits": {
+        "mode": "none"
+      },
+      "schema": {
+        "coins": {
+          "type": "integer",
+          "default": 0
+        },
+        "items": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "bestScore": {
+          "type": "integer",
+          "default": 0
+        },
+        "lastDailyAt": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "echo-input",
+      "endpoint": "echo-input",
+      "steamId": "76561198000000001",
+      "body": {
+        "a": 1,
+        "nested": {
+          "b": [
+            1,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "name": "echo-no-player",
+      "endpoint": "echo-input",
+      "steamId": null,
+      "body": {}
+    },
+    {
+      "name": "records-roundtrip",
+      "endpoint": "records-roundtrip",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "records-no-player",
+      "endpoint": "records-roundtrip",
+      "steamId": null,
+      "body": {}
+    },
+    {
+      "name": "secret-probe",
+      "endpoint": "secret-probe",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "fail-default",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "default"
+      }
+    },
+    {
+      "name": "fail-teapot",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "teapot"
+      }
+    },
+    {
+      "name": "fail-server-status",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "server"
+      }
+    },
+    {
+      "name": "fail-empty-code",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "empty-code"
+      }
+    },
+    {
+      "name": "fail-ok",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "fail-caught",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "caught-fail"
+      }
+    },
+    {
+      "name": "fail-caught-bad-status",
+      "endpoint": "fail-codes",
+      "steamId": null,
+      "body": {
+        "mode": "caught-bad-status"
+      }
+    },
+    {
+      "name": "ts-probe-ok",
+      "endpoint": "ts-probe",
+      "steamId": null,
+      "body": {
+        "value": 21,
+        "label": "x"
+      }
+    },
+    {
+      "name": "ts-probe-invalid",
+      "endpoint": "ts-probe",
+      "steamId": null,
+      "body": {
+        "value": 1.5
+      }
+    },
+    {
+      "name": "submit-score-ok",
+      "endpoint": "submit-score",
+      "steamId": "76561198000000001",
+      "body": {
+        "score": 120
+      }
+    },
+    {
+      "name": "submit-score-ts-ok",
+      "endpoint": "submit-score-ts",
+      "steamId": "76561198000000001",
+      "body": {
+        "score": 50
+      }
+    },
+    {
+      "name": "submit-score-invalid",
+      "endpoint": "submit-score",
+      "steamId": "76561198000000001",
+      "body": {
+        "score": -1
+      }
+    },
+    {
+      "name": "submit-score-anon",
+      "endpoint": "submit-score",
+      "steamId": null,
+      "body": {
+        "score": 5
+      }
+    },
+    {
+      "name": "profile",
+      "endpoint": "profile",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "profile-ts",
+      "endpoint": "profile-ts",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "profile-anon",
+      "endpoint": "profile",
+      "steamId": null,
+      "body": {}
+    },
+    {
+      "name": "daily-reward",
+      "endpoint": "daily-reward",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "daily-reward-ts",
+      "endpoint": "daily-reward-ts",
+      "steamId": "76561198000000001",
+      "body": {}
+    },
+    {
+      "name": "grant-coins",
+      "endpoint": "grant-coins",
+      "steamId": null,
+      "secret": true,
+      "body": {
+        "steamId": "76561198000000002",
+        "amount": 25
+      }
+    },
+    {
+      "name": "grant-coins-ts",
+      "endpoint": "grant-coins-ts",
+      "steamId": null,
+      "secret": true,
+      "body": {
+        "steamId": "76561198000000002",
+        "amount": 5
+      }
+    },
+    {
+      "name": "grant-coins-no-key",
+      "endpoint": "grant-coins",
+      "steamId": null,
+      "secret": false,
+      "body": {
+        "steamId": "76561198000000002",
+        "amount": 5
+      }
+    },
+    {
+      "name": "grant-coins-bad-amount",
+      "endpoint": "grant-coins",
+      "steamId": null,
+      "secret": true,
+      "body": {
+        "steamId": "76561198000000002",
+        "amount": 0
+      }
+    },
+    {
+      "name": "buy-item-anon",
+      "endpoint": "buy-item",
+      "steamId": null,
+      "body": {
+        "itemId": "sword"
+      }
+    },
+    {
+      "name": "buy-item-ok",
+      "endpoint": "buy-item",
+      "steamId": "76561198000000002",
+      "body": {
+        "itemId": "sword"
+      }
+    },
+    {
+      "name": "buy-item-owned",
+      "endpoint": "buy-item",
+      "steamId": "76561198000000002",
+      "body": {
+        "itemId": "sword"
+      }
+    },
+    {
+      "name": "buy-item-poor",
+      "endpoint": "buy-item",
+      "steamId": "76561198000000003",
+      "body": {
+        "itemId": "sword"
+      }
+    },
+    {
+      "name": "buy-item-ts",
+      "endpoint": "buy-item-ts",
+      "steamId": "76561198000000002",
+      "body": {
+        "itemId": "shield"
+      }
+    },
+    {
+      "name": "inventory-not-routable",
+      "endpoint": "inventory",
+      "steamId": "76561198000000002",
+      "body": {}
+    }
+  ]
+}

@@ -2,6 +2,9 @@ import type { EndpointHandler, EndpointRequest, Ns, WorkflowFunction } from "../
 import type { CollectionDefinition } from "../storage/types.js";
 import { resolveTemplate } from "./expression.js";
 import { conditionRoute, DslResponse, newRunState, recordStepFinding, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
+import { analyzeScript, ScriptModuleUnsupported, ScriptSyntaxError, type CompiledScript } from "../script/analysis.js";
+import { scriptHandler } from "../script/handler.js";
+import { ScriptEngineMissing } from "../script/load.js";
 
 // Compiles declarative YAML documents (endpoint, workflow, collection) into the handler shapes the engine runs.
 // Documents are validated up front, so a document that compiles never fails for structural reasons at runtime.
@@ -10,6 +13,7 @@ export class DefinitionError extends Error {
   constructor(
     readonly path: string,
     message: string,
+    readonly code: string = "VALIDATION_FAILED",
   ) {
     super(`${path}: ${message}`);
     this.name = "DefinitionError";
@@ -21,6 +25,8 @@ export interface CompiledEndpoint {
   method: "GET" | "POST";
   exposure: string;
   requiresSecretKey: boolean;
+  scope: "public" | "global";
+  script: CompiledScript | null;
   handler: EndpointHandler;
 }
 
@@ -29,7 +35,10 @@ export interface CompiledWorkflow {
   definition: WorkflowFunction;
 }
 
-const ENDPOINT_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "exposure", "internal", "internalOnly", "method", "requiresSecretKey", "input", "steps", "response"];
+const ENDPOINT_FIELDS = ["sourceVersion", "kind", "id", "slug", "enabled", "name", "description", "exposure", "internal", "internalOnly", "method", "requiresSecretKey", "input", "steps", "response"];
+// Top-level fields that make a document a script endpoint (the server's IsScriptedEndpoint).
+const SCRIPT_FIELDS = ["runtime", "script", "scope", "scriptFile"];
+const SCRIPT_MAX_BYTES = 64 * 1024;
 const WORKFLOW_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "definition"];
 // The collection envelope. Every other top-level key is the body, which is the server's shape (see compileCollection).
 const COLLECTION_ENVELOPE = ["sourceVersion", "kind", "id", "name", "description", "definition"];
@@ -63,8 +72,9 @@ function rejectUnknown(doc: Record<string, unknown>, allowed: readonly string[],
 }
 
 function checkSourceVersion(doc: Record<string, unknown>, kind: string, path: string): void {
-  if (doc["sourceVersion"] !== 1) throw new DefinitionError(`${path}.sourceVersion`, "must be 1.");
-  if (doc["kind"] !== kind) throw new DefinitionError(`${path}.kind`, `must be "${kind}".`);
+  // The server's rule: sourceVersion and kind are optional. When declared they must be 1 and this document's kind.
+  if (doc["sourceVersion"] !== undefined && doc["sourceVersion"] !== 1) throw new DefinitionError(`${path}.sourceVersion`, "must be 1.");
+  if (doc["kind"] !== undefined && doc["kind"] !== kind) throw new DefinitionError(`${path}.kind`, `must be "${kind}".`);
 }
 
 // Validates a step list recursively. A problem with one step is recorded as a finding on that step (recordStepFinding):
@@ -200,11 +210,49 @@ function renderResponse(response: Record<string, unknown>, state: RunState): Dsl
   return new DslResponse(status, resolveTemplate(response["body"] ?? {}, state.scope, scopeOf(state.ns)));
 }
 
+// The server's script rules for one endpoint or global document (ValidateScriptEndpoint). Cross-document import
+// checks (GLOBAL_NOT_FOUND, GLOBAL_EXPORT_NOT_FOUND, GLOBAL_CYCLE) run at sync, over the whole catalog.
+function compileScript(doc: Record<string, unknown>, id: string): { scope: "public" | "global"; compiled: CompiledScript } {
+  if (doc["steps"] !== undefined) throw new DefinitionError("endpoint.steps", "cannot be combined with script.", "SCRIPT_AND_STEPS");
+  const runtime = doc["runtime"];
+  if (runtime === undefined) throw new DefinitionError("endpoint.runtime", "is required for a script endpoint.", "MISSING_RUNTIME");
+  if (runtime !== "javascript" && runtime !== "typescript") {
+    throw new DefinitionError("endpoint.runtime", "must be javascript or typescript.", "INVALID_RUNTIME");
+  }
+  const scope = doc["scope"] ?? "public";
+  if (scope !== "public" && scope !== "global") throw new DefinitionError("endpoint.scope", "must be public or global.", "INVALID_SCOPE");
+  const source = doc["script"];
+  if (source === undefined && doc["scriptFile"] !== undefined) {
+    throw new DefinitionError("endpoint.scriptFile", "needs script: the script text is the source.", "SCRIPT_FILE_WITHOUT_SCRIPT");
+  }
+  if (source === undefined) throw new DefinitionError("endpoint.script", "is required for a script endpoint.", "MISSING_SCRIPT");
+  if (typeof source !== "string") throw new DefinitionError("endpoint.script", "must be a string.", "INVALID_SCRIPT");
+  if (new TextEncoder().encode(source).byteLength > SCRIPT_MAX_BYTES) {
+    throw new DefinitionError("endpoint.script", `is larger than ${SCRIPT_MAX_BYTES} bytes.`, "SCRIPT_TOO_LARGE");
+  }
+  let compiled: CompiledScript;
+  try {
+    compiled = analyzeScript(source, runtime, scope === "global" ? `globals/${id}` : "endpoint");
+  } catch (error) {
+    if (error instanceof ScriptSyntaxError) throw new DefinitionError("endpoint.script", error.message, "SCRIPT_SYNTAX");
+    if (error instanceof ScriptModuleUnsupported) throw new DefinitionError("endpoint.script", error.message, "SCRIPT_MODULE_UNSUPPORTED");
+    if (error instanceof ScriptEngineMissing) throw new DefinitionError("endpoint.script", error.message, "SCRIPT_ENGINE_MISSING");
+    throw error;
+  }
+  if (scope === "public" && !compiled.exports.includes("default")) {
+    throw new DefinitionError("endpoint.script", "must export default function handle(req, ns).", "INVALID_SCRIPT");
+  }
+  return { scope, compiled };
+}
+
 export function compileEndpoint(source: unknown): CompiledEndpoint {
   const doc = requireObject(source, "endpoint");
-  rejectUnknown(doc, ENDPOINT_FIELDS, "endpoint");
+  rejectUnknown(doc, [...ENDPOINT_FIELDS, ...SCRIPT_FIELDS], "endpoint");
   checkSourceVersion(doc, "endpoint", "endpoint");
   const id = requireId(doc["id"], "endpoint.id");
+  // The server routes an endpoint by slug. This SDK routes by id, so a declared slug must equal the id.
+  if (doc["slug"] !== undefined && doc["slug"] !== id) throw new DefinitionError("endpoint.slug", "must equal endpoint.id; this SDK routes endpoints by id.");
+  if (doc["enabled"] !== undefined && typeof doc["enabled"] !== "boolean") throw new DefinitionError("endpoint.enabled", "must be true or false.");
   const method = doc["method"];
   if (method !== "GET" && method !== "POST") throw new DefinitionError("endpoint.method", "must be GET or POST.");
   // The server's rule: exposure is optional and defaults to public. The legacy internal and internalOnly flags also make an endpoint internal.
@@ -216,6 +264,10 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
   const exposure = declaredExposure === "internal" || legacyInternal ? "internal" : "public";
   const requiresSecretKey = doc["requiresSecretKey"] === true;
   validateInputSchema(doc["input"], "endpoint.input");
+  if (SCRIPT_FIELDS.some((field) => doc[field] !== undefined)) {
+    const script = compileScript(doc, id);
+    return { id, method, exposure, requiresSecretKey, scope: script.scope, script: script.compiled, handler: scriptHandler(script.compiled.module) };
+  }
   validateSteps(doc["steps"] ?? [], "endpoint.steps", new Set(), []);
   const response = requireObject(doc["response"] ?? { status: 200, body: {} }, "endpoint.response");
   const steps = (doc["steps"] ?? []) as readonly StepDef[];
@@ -230,7 +282,7 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
     runSteps(steps, state);
     return renderResponse(response, state);
   };
-  return { id, method, exposure, requiresSecretKey, handler };
+  return { id, method, exposure, requiresSecretKey, scope: "public", script: null, handler };
 }
 
 export function compileWorkflow(source: unknown): CompiledWorkflow {

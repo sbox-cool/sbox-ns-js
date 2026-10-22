@@ -1,0 +1,14 @@
+sourceVersion: 1
+kind: endpoint
+id: echo-input
+slug: echo-input
+name: Echo input
+method: POST
+enabled: true
+requiresSecretKey: false
+exposure: public
+runtime: javascript
+script: |
+  export default function handle(req, ns) {
+    return { ok: true, method: req.method, input: req.input, player: req.player };
+  }

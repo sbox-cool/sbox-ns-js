@@ -1,0 +1,18 @@
+sourceVersion: 1
+kind: endpoint
+id: records-roundtrip
+slug: records-roundtrip
+name: Records round trip
+method: POST
+enabled: true
+requiresSecretKey: false
+exposure: public
+runtime: javascript
+script: |
+  export default function handle(req, ns) {
+    const key = req.player.steamId;
+    const before = ns.records.get("players", key);
+    ns.records.put("players", key, { ...(before ?? {}), coins: (before?.coins ?? 0) + 1 });
+    const after = ns.records.get("players", key);
+    return { ok: true, before, after };
+  }

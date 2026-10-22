@@ -66,8 +66,25 @@ export interface Ns {
 // Mirrors the `globals` declared in ns.d.ts: exports of other endpoint modules, keyed by endpoint id.
 export type EndpointGlobal = (req: EndpointRequest, ns: Ns) => unknown;
 
+// A compiled script module. `specifier` is "endpoint" for an endpoint, or "globals/<id>" for a global. `code` is
+// CommonJS produced from the source, evaluated by the sandbox.
+export interface ScriptModule {
+  readonly specifier: string;
+  readonly code: string;
+}
+
+// Answers one ns or globals call from a script. `op` names the call (e.g. "records.get"); `args` are JSON values.
+export type ScriptBridge = (op: string, args: readonly unknown[]) => unknown;
+
+// Runs one pass of a script endpoint. Synchronous; throws the same typed errors a DSL handler would.
+export interface ScriptRunner {
+  run(entry: ScriptModule, request: EndpointRequest, bridge: ScriptBridge): unknown;
+}
+
 export interface EndpointScope {
   readonly globals: Readonly<Record<string, Readonly<Record<string, EndpointGlobal>>>>;
+  // Present for scripted endpoints only.
+  readonly scripts?: ScriptRunner;
 }
 
 export type WorkflowFunction = (input: Record<string, unknown>, ns: Ns) => unknown;

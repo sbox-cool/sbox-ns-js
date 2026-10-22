@@ -376,7 +376,7 @@ export function checkRecord(kind: ResourceKind, record: unknown, parse: Parser):
     const item = compileOne(kind, record, parse);
     return { ok: true, item, stored: item.entry.stored };
   } catch (error) {
-    return { ok: false, stored, fault: { stage: "definition", code: "VALIDATION_FAILED", message: messageOf(error), sourcePath: null, suggestedFix: null } };
+    return { ok: false, stored, fault: { stage: "definition", code: error instanceof DefinitionError ? error.code : "VALIDATION_FAILED", message: messageOf(error), sourcePath: null, suggestedFix: null } };
   }
 }
 
@@ -389,6 +389,50 @@ export function definitionFault(kind: ResourceKind, record: Readonly<Record<stri
     if (error instanceof DefinitionError) return { path: error.path, message: error.message };
     return { path: "/", message: messageOf(error) };
   }
+}
+
+// Cross-document script checks over the effective endpoints: the live catalog with the batch applied over it. Every
+// import must name a global endpoint, and every named export must exist on it. Globals may not import each other in a
+// cycle. Returns the first violation, or null.
+export function scriptGraphFault(catalog: Catalog, batch: readonly Compiled[]): { code: string; message: string } | null {
+  const effective = new Map<string, CompiledEndpoint>();
+  for (const [id, entry] of catalog.endpoints) effective.set(id, entry.compiled);
+  for (const item of batch) if (item.kind === "endpoints") effective.set(item.id, item.entry.compiled);
+  const globalEdges = new Map<string, string[]>();
+  for (const [id, compiled] of effective) {
+    if (compiled.script === null) continue;
+    if (compiled.scope === "global") globalEdges.set(id, []);
+    for (const { id: target, names } of compiled.script.imports) {
+      const global = effective.get(target);
+      if (global === undefined || global.scope !== "global" || global.script === null) {
+        return { code: "GLOBAL_NOT_FOUND", message: `${id}: imports globals/${target}, which is not a global endpoint.` };
+      }
+      for (const name of names ?? []) {
+        if (!global.script.exports.includes(name)) {
+          return { code: "GLOBAL_EXPORT_NOT_FOUND", message: `${id}: globals/${target} does not export ${name}.` };
+        }
+      }
+      globalEdges.get(id)?.push(target);
+    }
+  }
+  if (hasCycle(globalEdges)) return { code: "GLOBAL_CYCLE", message: "Globals import each other in a cycle." };
+  return null;
+}
+
+// Depth-first search over the import edges. An edge back to a node still open on the path is a cycle.
+function hasCycle(edges: ReadonlyMap<string, readonly string[]>): boolean {
+  const state = new Map<string, "open" | "closed">();
+  const enter = (id: string): boolean => {
+    const seen = state.get(id);
+    if (seen === "closed") return false;
+    if (seen === "open") return true;
+    state.set(id, "open");
+    for (const next of edges.get(id) ?? []) if (enter(next)) return true;
+    state.set(id, "closed");
+    return false;
+  };
+  for (const id of edges.keys()) if (enter(id)) return true;
+  return false;
 }
 
 export function commitCompiled(catalog: Catalog, items: readonly Compiled[]): void {

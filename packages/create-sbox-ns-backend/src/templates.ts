@@ -19,6 +19,8 @@ const PACKAGE_JSON = {
   },
   dependencies: {
     "@sbox-ns/sdk": "^0.1.0",
+    "quickjs-emscripten": "^0.32.0",
+    sucrase: "^3.35.1",
     yaml: "^2.6.0",
   },
   devDependencies: {
