@@ -94,6 +94,8 @@ export function routeOf(raw: unknown, fallback: "continue" | "reject"): Route | 
     if (raw === "skip") return { action: "skip", count: 1 };
     return raw === "" ? null : { action: "goto", target: raw };
   }
+  if (raw === true) return { action: fallback };
+  if (raw === false) return { action: "reject" };
   if (!isObject(raw)) return null;
   if (typeof raw["action"] === "string") return routeByAction(raw["action"], raw);
   if (raw["step"] !== undefined || raw["target"] !== undefined || raw["goto"] !== undefined) {
@@ -104,6 +106,29 @@ export function routeOf(raw: unknown, fallback: "continue" | "reject"): Route | 
   }
   if (raw["skip"] !== undefined) return routeByAction("skip", raw);
   return routeByAction(fallback, raw);
+}
+
+// The route a condition takes for one outcome, with the reference's precedence: `onTrue`/`onFalse`, then `routes.true`
+// (or `pass`) and `routes.false` (or `fail`), then the legacy `onFail` for a false outcome. Returns null for an invalid route.
+export function conditionRoute(step: Readonly<Record<string, unknown>>, outcome: "true" | "false"): Route | null {
+  const routes = isObject(step["routes"]) ? step["routes"] : {};
+  if (outcome === "true") return routeOf(step["onTrue"] ?? routes["true"] ?? routes["pass"], "continue");
+  const raw = step["onFalse"] ?? routes["false"] ?? routes["fail"];
+  return raw === undefined || raw === null ? legacyOnFailRoute(step["onFail"]) : routeOf(raw, "reject");
+}
+
+// Normalizes a legacy `onFail` value: `"skip"`, an object whose `skip`/`skipSteps`/`steps` names a step or `"next"`, or
+// an object that rejects. A missing or non-object value rejects with the default error.
+function legacyOnFailRoute(onFail: unknown): Route | null {
+  if (onFail === "skip") return { action: "skip", count: 1 };
+  if (!isObject(onFail)) return { action: "reject" };
+  const skip = onFail["skip"] ?? onFail["skipSteps"] ?? onFail["steps"];
+  if (onFail["action"] === "skip" || (skip !== undefined && skip !== null)) {
+    if (typeof skip === "string" && skip !== "next") return { action: "goto", target: skip };
+    return { action: "skip", count: typeof skip === "number" ? skip : 1 };
+  }
+  if (onFail["reject"] === false) return { action: "continue" };
+  return routeByAction("reject", onFail);
 }
 
 function routeByAction(action: string, raw: Readonly<Record<string, unknown>>): Route | null {
@@ -250,8 +275,7 @@ function runWorkflowInto(key: string, workflow: string, params: unknown, state: 
 
 // Applies a condition route. Returns the flow the route requests, or null to continue with the next step.
 function applyRoute(step: StepDef, outcome: "true" | "false", state: RunState): Flow | null {
-  const routes = isObject(step["routes"]) ? step["routes"] : {};
-  const route = routeOf(routes[outcome], outcome === "true" ? "continue" : "reject");
+  const route = conditionRoute(step, outcome);
   if (route === null) state.ns.fail("INVALID_STEP", `Condition "${step.id}": unsupported route action.`, 500);
   switch (route.action) {
     case "continue":
@@ -575,14 +599,6 @@ function runStep(step: StepDef, state: RunState): Flow | null {
     case "condition": {
       const passed = evaluateCond(step["check"], state);
       scope[step.id] = passed;
-      const onFail = step["onFail"];
-      if (!passed && isObject(onFail)) {
-        state.ns.fail(
-          typeof onFail["error"] === "string" ? onFail["error"] : "CONDITION_FAILED",
-          renderMessage(onFail["message"], state, "Condition failed."),
-          typeof onFail["status"] === "number" ? onFail["status"] : 400,
-        );
-      }
       return applyRoute(step, passed ? "true" : "false", state);
     }
     case "assert": {

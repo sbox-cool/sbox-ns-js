@@ -32,9 +32,8 @@ type SourceKind = "endpoint" | "workflow" | "collection" | "query" | "test";
 const SUPPORTED_KINDS: readonly SourceKind[] = ["endpoint", "workflow", "collection", "query", "test"];
 const ACCEPTED_LAYOUTS = ["flat", "definition-wrapper", "mixed-definition-wrapper"];
 const FAILURE_LAYOUTS = ["flat", "definition-wrapper"];
-// Only features the DSL compiler implements. The reference also lists retry, onTrue/onFalse and legacy-onFail, which
-// this compiler does not accept.
-const SUPPORTED_FEATURES = ["exposure", "routes.true", "routes.false", "sleep", "goto", "run", "return"];
+// Features the DSL compiler implements, in the reference's order.
+const SUPPORTED_FEATURES = ["exposure", "routes.true", "routes.false", "onTrue", "onFalse", "sleep", "retry", "goto", "run", "return", "legacy-onFail"];
 const AUTHORING_FIELDS = ["authoringMode", "sourceFormat", "sourcePath", "sourceText", "sourceVersion"];
 
 // Source bookkeeping that is never part of the canonical definition.

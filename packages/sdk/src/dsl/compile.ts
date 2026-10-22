@@ -1,7 +1,7 @@
 import type { EndpointHandler, EndpointRequest, Ns, WorkflowFunction } from "../endpoint/types.js";
 import type { CollectionDefinition } from "../storage/types.js";
 import { resolveTemplate } from "./expression.js";
-import { DslResponse, newRunState, recordStepFinding, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
+import { conditionRoute, DslResponse, newRunState, recordStepFinding, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
 
 // Compiles declarative YAML documents (endpoint, workflow, collection) into the handler shapes the engine runs.
 // Documents are validated up front, so a document that compiles never fails for structural reasons at runtime.
@@ -90,7 +90,8 @@ function validateSteps(steps: unknown, path: string, seen: Set<string>, enclosin
       if (Array.isArray(nested)) validateSteps(nested, `${at}.steps`, seen, visible);
       else recordStepFinding(step, `${at}.steps: must be a list of steps.`);
     }
-    if (step["routes"] !== undefined) validateRoutes(step, `${at}.routes`, visible);
+    if (type === "condition") validateCondition(step, at, visible);
+    else if (step["routes"] !== undefined) validateRoutes(step, `${at}.routes`, visible);
   }
 }
 
@@ -125,6 +126,34 @@ function validateRoutes(step: Record<string, unknown>, path: string, visible: re
     if (route === null) recordStepFinding(step, `${at}: is not a valid route.`);
     else if (route.action === "goto" && !visible.includes(route.target)) {
       recordStepFinding(step, `${at}: goto target "${route.target}" is not a step in scope.`);
+    }
+  }
+}
+
+const CONDITION_ROUTE_KEYS = ["true", "false", "pass", "fail"];
+
+// A condition's routes come from `routes`, `onTrue`/`onFalse`, or the legacy `onFail`. Every effective route must be valid,
+// and a goto must name a step in scope. `retry` is accepted and ignored, as the reference does. Problems are findings on
+// the step: it is stored and fails when it runs.
+function validateCondition(step: Record<string, unknown>, at: string, visible: readonly string[]): void {
+  if (step["routes"] !== undefined) {
+    if (!isObject(step["routes"])) {
+      recordStepFinding(step, `${at}.routes: must be an object.`);
+      return;
+    }
+    for (const outcome of Object.keys(step["routes"])) {
+      if (!CONDITION_ROUTE_KEYS.includes(outcome)) recordStepFinding(step, `${at}.routes.${outcome}: must be true, false, pass, or fail.`);
+    }
+  }
+  const onFail = step["onFail"];
+  if (onFail !== undefined && onFail !== null && onFail !== "skip" && !isObject(onFail)) {
+    recordStepFinding(step, `${at}.onFail: must be an object or "skip".`);
+  }
+  for (const outcome of ["true", "false"] as const) {
+    const route = conditionRoute(step, outcome);
+    if (route === null) recordStepFinding(step, `${at}.${outcome}: is not a valid route.`);
+    else if (route.action === "goto" && !visible.includes(route.target)) {
+      recordStepFinding(step, `${at}.${outcome}: goto target "${route.target}" is not a step in scope.`);
     }
   }
 }

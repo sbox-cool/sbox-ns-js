@@ -26,7 +26,7 @@ const GAMECFG = {
 };
 
 function collectionEntry(doc: Record<string, unknown>): CollectionEntry {
-  return { document: doc, record: doc, compiled: compileCollection(doc) };
+  return { stored: doc, record: doc, compiled: compileCollection(doc) };
 }
 
 describe("endpoint exposure, as the server reads it", () => {

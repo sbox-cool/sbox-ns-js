@@ -263,6 +263,95 @@ describe("goto, skip and visit limits", () => {
   });
 });
 
+describe("condition routes", () => {
+  const open = { field: "input.open", op: "==", value: true };
+
+  it("onFalse takes precedence over routes.false", async () => {
+    const body = await bodyOf(
+      endpointDoc(
+        [
+          { id: "gate", type: "condition", check: open, onFalse: "return", routes: { false: { action: "reject", error: "NOPE" } } },
+          { id: "after", type: "compute", values: { ran: "true" } },
+        ],
+        { after: "{{ after }}" },
+      ),
+      { open: false },
+    );
+    assert.equal(body["after"], undefined);
+  });
+
+  it("routes.fail is the alias of routes.false", async () => {
+    const failure = await failureOf(
+      endpointDoc([{ id: "gate", type: "condition", check: open, routes: { fail: { action: "reject", error: "CLOSED" } } }], {}),
+      { open: false },
+    );
+    assert.equal(failure.code, "CLOSED");
+  });
+
+  it("a legacy onFail reject is a condition rejection with its own error", async () => {
+    const failure = await failureOf(
+      endpointDoc(
+        [{ id: "gate", type: "condition", check: open, onFail: { error: "CLOSED", message: "closed", status: 409, flag: true, severity: "high", webhook: true } }],
+        {},
+      ),
+      { open: false },
+    );
+    assert.equal(failure.code, "CLOSED");
+    assert.equal(failure.message, "closed");
+    assert.equal(failure.status, 409);
+    assert.equal(failure.details["conditionRejection"], true);
+    assert.equal(failure.details["flagged"], true);
+    assert.equal(failure.details["severity"], "high");
+    assert.equal(failure.details["fireWebhook"], true);
+  });
+
+  it("a legacy onFail with reject:false continues past the failed check", async () => {
+    const body = await bodyOf(
+      endpointDoc(
+        [
+          { id: "gate", type: "condition", check: open, onFail: { reject: false } },
+          { id: "after", type: "compute", values: { ran: "true" } },
+        ],
+        { after: "{{ after }}" },
+      ),
+      { open: false },
+    );
+    assert.deepEqual(body["after"], { ran: true });
+  });
+
+  it('a legacy onFail of "skip" skips one step when the check fails', async () => {
+    const body = await bodyOf(
+      endpointDoc(
+        [
+          { id: "gate", type: "condition", check: open, onFail: "skip" },
+          { id: "marker", type: "compute", values: { hit: "true" } },
+          { id: "after", type: "compute", values: { ran: "true" } },
+        ],
+        { marker: "{{ marker }}", after: "{{ after }}" },
+      ),
+      { open: false },
+    );
+    assert.equal(body["marker"], undefined);
+    assert.deepEqual(body["after"], { ran: true });
+  });
+
+  it("retry is accepted and ignored", async () => {
+    const body = await bodyOf(
+      endpointDoc([{ id: "gate", type: "condition", check: open, retry: { attempts: 3 } }, { id: "after", type: "compute", values: { ran: "true" } }], {
+        after: "{{ after }}",
+      }),
+      { open: true },
+    );
+    assert.deepEqual(body["after"], { ran: true });
+  });
+
+  it("stores an onFail that is neither an object nor skip, and fails the step when it runs", async () => {
+    const failure = await failureOf(endpointDoc([{ id: "gate", type: "condition", check: open, onFail: 42 }], {}), { open: false });
+    assert.equal(failure.code, "ENDPOINT_ERROR.CONDITION");
+    assert.match(failure.message, /onFail: must be an object or "skip"/);
+  });
+});
+
 describe("sleep step", () => {
   it("awaits its timer and reports the slept duration", async () => {
     mock.timers.enable({ apis: ["setTimeout"] });
