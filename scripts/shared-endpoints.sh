@@ -80,9 +80,10 @@ parse_key() {
   [[ -n "$key" ]] || { echo 'Cannot parse CLI key output' >&2; return 1; }
   printf '%s' "$key"
 }
-# Extracts the first antiforgery token from an ASP.NET page.
+# Extracts an antiforgery token from an ASP.NET page. Every command reads its whole input: an early `head` would make
+# the writer fail with SIGPIPE, which pipefail turns into a script exit.
 antiforgery_token() {
-  grep -o 'name="__RequestVerificationToken"[^>]*' | head -n 1 | grep -o 'value="[^"]*"' | head -n 1 | sed 's/^value="//; s/"$//'
+  sed -n 's/.*name="__RequestVerificationToken"[^>]*value="\([^"]*\)".*/\1/p' | sed -n '1p'
 }
 
 # Reference server: fresh state, an owner account, one project, one public and one secret key.
