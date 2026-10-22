@@ -1,0 +1,84 @@
+name: Engine leg
+
+# Serves a fresh create-sbox-ns-backend project to a source-built s&box dedicated server.
+# ci-only evidence: the dedicated server runs headless on windows-latest; no native editor run happens here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      libraries:
+        description: "Space-separated library targets: main, latest (highest r<N> tag), or r<N>"
+        required: false
+        default: "main latest"
+      engine_ref:
+        description: "Facepunch/sbox-public ref (default: its default branch)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-leg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out sbox-ns-js
+        uses: actions/checkout@v4
+
+      - name: Check out sbox-network-storage-server (main)
+        uses: actions/checkout@v4
+        with:
+          repository: sbox-cool/sbox-network-storage-server
+          ref: main
+          path: sbox-network-storage-server
+
+      - name: Set up Node 22 (node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up .NET from the server global.json
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: sbox-network-storage-server/global.json
+
+      - name: Clone and build Facepunch/sbox-public
+        shell: pwsh
+        env:
+          ENGINE_REF: ${{ inputs.engine_ref }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $engineDir = "$env:RUNNER_TEMP\sbox-public"
+          git clone --filter=blob:none https://github.com/Facepunch/sbox-public $engineDir
+          if ($env:ENGINE_REF) { git -C $engineDir checkout $env:ENGINE_REF }
+          Push-Location $engineDir
+          cmd /c Setup.bat
+          if ($LASTEXITCODE -ne 0) { throw "Setup.bat exited $LASTEXITCODE" }
+          Pop-Location
+          $game = "$engineDir\game"
+          if (-not (Test-Path "$game\sbox-server.exe")) { throw "sbox-server.exe not built" }
+          if (-not (Test-Path "$game\bin\managed\sbox-cli.exe")) { throw "sbox-cli.exe not built" }
+          "ENGINE_GAME=$game" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ENGINE_SHA=$(git -C $engineDir rev-parse HEAD)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run engine leg
+        shell: pwsh
+        env:
+          LIBRARIES: ${{ inputs.libraries }}
+        run: |
+          $libs = $env:LIBRARIES -split '\s+' | Where-Object { $_ -ne '' }
+          ./scripts/ci/engine-leg.ps1 -Engine $env:ENGINE_GAME -ServerDir "$PWD\sbox-network-storage-server" -Out "$PWD\engine-leg-out" -Libraries $libs
+
+      - name: Upload engine leg evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-leg-${{ github.run_id }}
+          path: engine-leg-out
+          if-no-files-found: warn
+          retention-days: 30
