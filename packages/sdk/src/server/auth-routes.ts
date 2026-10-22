@@ -76,14 +76,14 @@ export async function handleAuthSession(
   }
   if (!safeEqual(publicKey, options.publicKey)) return sessionFailure("UNAUTHORIZED", null, requestId);
   const secret = options.sessionSecret;
-  if (secret === null || !options.settings.enableAuthSessions) {
+  if (secret === null || !ctx.settings().security.enableAuthSessions) {
     return sessionFailure("AUTH_SESSION_DISABLED", null, requestId);
   }
   try {
     const body = await readJsonBody(request);
     const nowMs = ctx.now();
     const credentials = credentialsOf(request, url, body);
-    const ttlSeconds = normalizeSessionTtl(options.settings.authSessionTtlSeconds ?? DEFAULT_SESSION_TTL_SECONDS);
+    const ttlSeconds = normalizeSessionTtl(ctx.settings().security.authSessionTtlSeconds ?? DEFAULT_SESSION_TTL_SECONDS);
     const identityOptions = identityOptionsFor(ctx, "", nowMs);
 
     if (op === "create") {

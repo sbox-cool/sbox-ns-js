@@ -1,4 +1,5 @@
 import type { IdentityOptions } from "../protocol/identity.js";
+import type { SecuritySettings } from "../protocol/config.js";
 import type { EndpointStorage } from "../storage/types.js";
 import { createCatalog, stagedCatalogOf, storageDefinitionOf, valuesOf, type Catalog } from "./catalog.js";
 import { createConfigSource, type ConfigSource } from "./config.js";
@@ -10,6 +11,13 @@ import { createSyncJobs, type SyncJobs } from "./sync-jobs.js";
 export interface RuntimeView {
   readonly catalog: Catalog;
   readonly storage: EndpointStorage;
+}
+
+// The settings a management write changes. The security settings feed the protocol and the signed config; the
+// request-facing flag is read per call too.
+export interface ManagedSettings {
+  readonly security: SecuritySettings;
+  readonly requireSboxAuth: boolean;
 }
 
 export interface ServerContext {
@@ -25,6 +33,9 @@ export interface ServerContext {
   storage(): EndpointStorage;
   // The runtime for a publish target. next=false reads the live catalog; next=true reads it with the staged revision applied.
   view(next: boolean): RuntimeView;
+  // The settings management writes replace. Requests read them per call, so a change applies to the next request.
+  settings(): ManagedSettings;
+  replaceSettings(next: ManagedSettings): void;
 }
 
 // In-process revocation list. Entries live until their session would have expired anyway. Multi-instance
@@ -47,6 +58,7 @@ export function createServerContext(options: ServerOptions): ServerContext {
   const now = options.now ?? (() => Date.now());
   let cached: { readonly revision: number; readonly storage: EndpointStorage } | null = null;
   let overlay: { readonly revision: number; readonly view: RuntimeView } | null = null;
+  let managed: ManagedSettings = { security: options.settings, requireSboxAuth: options.requireSboxAuth ?? false };
   const liveStorage = (): EndpointStorage => {
     if (cached === null || cached.revision !== catalog.revision) {
       cached = { revision: catalog.revision, storage: options.storage(storageDefinitionOf(catalog, values())) };
@@ -55,7 +67,7 @@ export function createServerContext(options: ServerOptions): ServerContext {
   };
   return {
     options,
-    config: createConfigSource(options),
+    config: createConfigSource(options, () => managed.security),
     revocations: options.sessionRevocations ?? createMemoryRevocations(),
     catalog,
     syncJobs: createSyncJobs(now, options.projectId),
@@ -71,6 +83,10 @@ export function createServerContext(options: ServerOptions): ServerContext {
       }
       return overlay.view;
     },
+    settings: () => managed,
+    replaceSettings(next) {
+      managed = next;
+    },
   };
 }
 
@@ -85,7 +101,7 @@ export function identityOptionsFor(
     endpointSlug,
     apiKey: options.publicKey,
     ownerUserId: options.ownerUserId,
-    requireSboxAuth: options.requireSboxAuth ?? false,
+    requireSboxAuth: ctx.settings().requireSboxAuth,
     sessions: options.sessionSecret === null ? null : { secret: options.sessionSecret },
     nowMs,
     fetch: globalThis.fetch,

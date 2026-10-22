@@ -120,7 +120,7 @@ async function guardAccess(
     throw new StorageRefusal(403, { error: "RECORD_DELETE_DISABLED", detail: "Record deletion is not enabled for this collection." });
   }
   // Auth-disabled projects keep the unverified client identity and skip the ownership gate.
-  if (ctx.options.requireSboxAuth !== true) return;
+  if (!ctx.settings().requireSboxAuth) return;
   let steamId: string;
   try {
     steamId = await playerOf(ctx, request, url, body);

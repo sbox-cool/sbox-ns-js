@@ -156,7 +156,7 @@ async function runCall(
   const headerCredentials = credentialsOf(request, url, envelope ?? body);
   const presentedToken = readSessionToken(headerCredentials);
   const sessionId =
-    presentedToken !== null && options.sessionSecret !== null && options.settings.enableAuthSessions
+    presentedToken !== null && options.sessionSecret !== null && ctx.settings().security.enableAuthSessions
       ? (await verifyAuthSession(options.sessionSecret, presentedToken, options.projectId, nowMs)).id
       : null;
 
@@ -205,7 +205,7 @@ async function runCall(
 
   const config = await ctx.config.current(nowMs, false);
   const denial = securityDenial({
-    project: options.settings,
+    project: ctx.settings().security,
     configVersion: config.configVersion,
     body: commandBody,
     hasSecretKey,
@@ -284,7 +284,7 @@ export async function executeEndpoint(
       secrets: options.secrets ?? NO_SECRETS,
       now: ctx.now,
       trackedFields: (collection) =>
-        options.settings.legacyPlayerProjections === true ? trackedFieldsOf(view.catalog, collection) : [],
+        ctx.settings().security.legacyPlayerProjections === true ? trackedFieldsOf(view.catalog, collection) : [],
       log: options.log ?? (() => undefined),
       signal: call.signal,
     },
@@ -338,7 +338,7 @@ async function consumeEnvelopeId(
     projectId: ctx.options.projectId,
     identityKey,
     requestId,
-    windowSeconds: clampReplayWindow(ctx.options.settings.encryptedRequestWindowSeconds),
+    windowSeconds: clampReplayWindow(ctx.settings().security.encryptedRequestWindowSeconds),
     nowMs,
   });
 }

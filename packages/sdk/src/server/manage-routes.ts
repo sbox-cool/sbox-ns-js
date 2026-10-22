@@ -24,7 +24,7 @@ import {
 import type { RuntimeView, ServerContext } from "./context.js";
 import { authorize, executeEndpoint, resolveEndpoint } from "./endpoints.js";
 import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
-import { managementSettingsView } from "./management-settings.js";
+import { applySettingsText, managementSettingsView } from "./management-settings.js";
 import { describeError, describedErrorBody, pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
 import { decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
 import { parseQuery } from "./query-routes.js";
@@ -270,6 +270,7 @@ export async function handleManage(
   if ((head === "settings" || head === "config") && rest.length === 1 && method === "GET") {
     return jsonResponse(settingsResponse(ctx), 200);
   }
+  if (head === "settings" && rest.length === 1 && method === "PUT") return putSettings(ctx, request);
   if (head === "game-values" && rest.length === 1) return gameValuesRoute(ctx, request);
   if (head === "sync" && second === "preflight" && rest.length === 2 && method === "POST") {
     return preflight(ctx, request, url);
@@ -338,7 +339,7 @@ function validateRoute(ctx: ServerContext, request: Request): Response {
 
 // Settings and config are the same document: the settings under both keys, plus the two flags the library reads.
 function settingsResponse(ctx: ServerContext): Record<string, unknown> {
-  const settings = managementSettingsView(ctx.options);
+  const settings = managementSettingsView(ctx.settings());
   return {
     ok: true,
     projectId: ctx.options.projectId,
@@ -528,6 +529,15 @@ async function putRateLimits(ctx: ServerContext, request: Request): Promise<Resp
   }
   ctx.catalog.rateLimitRules = rules;
   return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "upsert" }, 200);
+}
+
+// PUT /v3/manage/{project}/settings, as the reference's PutSettingsAsync. The stored fields replace the settings the
+// protocol reads from the next request on; the signed config follows at its next build.
+async function putSettings(ctx: ServerContext, request: Request): Promise<Response> {
+  const outcome = applySettingsText(ctx.settings(), await readBodyText(request), ctx.options.requestKeys);
+  if (!outcome.ok) return jsonResponse(outcome.body, 400);
+  ctx.replaceSettings(outcome.settings);
+  return jsonResponse(settingsResponse(ctx), 200);
 }
 
 async function putTests(ctx: ServerContext, request: Request): Promise<Response> {
