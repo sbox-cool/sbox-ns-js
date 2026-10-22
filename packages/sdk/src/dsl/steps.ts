@@ -1,5 +1,6 @@
 import type { Ns } from "../endpoint/types.js";
 import { internalsOf } from "../endpoint/execution.js";
+import { ScriptFailure } from "../endpoint/runtime.js";
 import {
   compareValues,
   ExpressionError,
@@ -74,7 +75,7 @@ export const STEP_TYPES: readonly string[] = [
 export type Route =
   | { action: "continue" }
   | { action: "return" }
-  | { action: "reject"; error?: string; message?: unknown; status?: number }
+  | { action: "reject"; error?: string; message?: unknown; status?: number; flag?: unknown; severity?: unknown; webhook?: unknown }
   | { action: "goto"; target: string }
   | { action: "skip"; count: number }
   | { action: "run"; workflow: string; params: unknown; as?: string };
@@ -119,6 +120,9 @@ function routeByAction(action: string, raw: Readonly<Record<string, unknown>>): 
         ...(typeof error === "string" ? { error } : {}),
         ...(message === undefined ? {} : { message }),
         ...(status === undefined ? {} : { status }),
+        flag: raw["flag"],
+        severity: raw["severity"],
+        webhook: raw["webhook"],
       };
     }
     case "goto": {
@@ -244,7 +248,12 @@ function applyRoute(step: StepDef, outcome: "true" | "false", state: RunState): 
       state.returned = true;
       return null;
     case "reject":
-      state.ns.fail(route.error ?? "CONDITION_FAILED", renderMessage(route.message, state, "Condition check failed."), route.status ?? 400);
+      throw new ScriptFailure(route.error ?? "CONDITION_FAILED", renderMessage(route.message, state, "Condition check failed."), route.status ?? 400, {
+        conditionRejection: true,
+        flagged: route.flag === true,
+        severity: route.severity ?? null,
+        fireWebhook: route.webhook === true,
+      });
     case "goto":
       return { kind: "goto", target: route.target };
     case "skip":

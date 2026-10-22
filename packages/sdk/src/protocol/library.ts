@@ -22,6 +22,7 @@ export interface LibraryErrorInput {
   requestId: string;
   errorFields?: Record<string, unknown>;
   security?: Record<string, unknown>;
+  details?: Readonly<Record<string, unknown>>;
 }
 
 // Mirrors server Compat/LibraryErrorEnvelope.cs Build(). The wire status is always 200 for library
@@ -40,6 +41,7 @@ export function libraryErrorBody(input: LibraryErrorInput): Record<string, unkno
     message: input.message,
     _requestId: input.requestId,
   };
+  if (input.details !== undefined) Object.assign(body, input.details);
   if (input.security !== undefined) {
     error.security = input.security;
     body.security = input.security;

@@ -18,12 +18,14 @@ import { RUN_INTERNALS, type ExecutionMode, type RunInternals } from "./executio
 export class ScriptFailure extends Error {
   readonly code: string;
   readonly status: number;
+  readonly details: Readonly<Record<string, unknown>>;
 
-  constructor(code: string, message: string, status: number) {
+  constructor(code: string, message: string, status: number, details: Readonly<Record<string, unknown>> = {}) {
     super(message);
     this.name = "ScriptFailure";
     this.code = code;
     this.status = status;
+    this.details = details;
   }
 }
 

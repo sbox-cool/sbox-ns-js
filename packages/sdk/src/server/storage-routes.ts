@@ -6,7 +6,7 @@ import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
 import { authorize } from "./endpoints.js";
-import { credentialsOf, pathSegment, readJsonBody, readJsonValue } from "./http.js";
+import { BODY_NOT_OBJECT, credentialsOf, pathSegment, readJsonBody, readJsonValue } from "./http.js";
 import { KeyRefusal } from "./auth-failure.js";
 import { handleQuery } from "./query-routes.js";
 import { LEDGER_COLLECTION, ledgerSummaryOf } from "../endpoint/ledger.js";
@@ -17,9 +17,6 @@ import { LEDGER_COLLECTION, ledgerSummaryOf } from "../endpoint/ledger.js";
 interface Access {
   readonly hasSecretKey: boolean;
 }
-
-// Successful Idempotency-Key appends, per server, so a replay returns the first response unchanged.
-const idempotentAppends = new WeakMap<ServerContext, Map<string, Record<string, unknown>>>();
 
 // Global-collection appends are limited per writer per collection per UTC day, as the reference server does
 // (8640 saves a day). Counters of earlier days are dropped on rollover.
@@ -116,10 +113,10 @@ async function guardAccess(
   if (access.hasSecretKey) return;
   const mode = String(definition.accessMode ?? "endpoint").toLowerCase();
   if (mode !== "public") {
-    throw new StorageRefusal(403, { ok: false, error: "ENDPOINT_ONLY", message: "This collection can only be accessed through endpoints." });
+    throw new StorageRefusal(403, { error: "ENDPOINT_ONLY", detail: "This collection can only be accessed through endpoints." });
   }
   if (op === "delete" && definition.allowRecordDelete !== true) {
-    throw new StorageRefusal(403, { ok: false, error: "RECORD_DELETE_DISABLED", message: "Record deletion is not enabled for this collection." });
+    throw new StorageRefusal(403, { error: "RECORD_DELETE_DISABLED", detail: "Record deletion is not enabled for this collection." });
   }
   // Auth-disabled projects keep the unverified client identity and skip the ownership gate.
   if (ctx.options.requireSboxAuth !== true) return;
@@ -128,16 +125,15 @@ async function guardAccess(
     steamId = await playerOf(ctx, request, url, body);
   } catch (error) {
     if (error instanceof ProtocolError) {
-      throw new StorageRefusal(error.status, { ok: false, error: error.code, message: error.message });
+      throw new StorageRefusal(error.status, { error: error.code, detail: error.message });
     }
     throw error;
   }
   if (op === "read" || definition.collectionType === "global") return;
   if (!isOwnDocumentKey(key, steamId)) {
     throw new StorageRefusal(403, {
-      ok: false,
       error: "FORBIDDEN",
-      message: "Players can only modify their own documents: the key must be the verified Steam ID or start with '{steamId}_'.",
+      detail: "Players can only modify their own documents: the key must be the verified Steam ID or start with '{steamId}_'.",
     });
   }
 }
@@ -154,7 +150,6 @@ function keyNotFound(): Response {
 function recordNotFound(): Response {
   return jsonResponse(
     {
-      ok: false,
       error: {
         code: "RECORD_NOT_FOUND",
         docsUrl: "https://sboxcool.com/wiki/network-storage-v3/collections#save-slots",
@@ -166,7 +161,7 @@ function recordNotFound(): Response {
 }
 
 function asDocument(body: unknown): RecordData {
-  if (!isRecord(body)) throw new ProtocolError(400, "INVALID_BODY", "Body must be a JSON object.");
+  if (!isRecord(body)) throw new ProtocolError(400, "INVALID_BODY", BODY_NOT_OBJECT);
   return body;
 }
 
@@ -299,21 +294,15 @@ async function appendRecord(
 ): Promise<Response> {
   const definition = requireDeclared(ctx, collectionId);
   if (definition.collectionType !== "global") {
-    throw new ProtocolError(400, "COLLECTION_TYPE_MISMATCH", "Only global collections accept appends.");
+    throw new ProtocolError(400, "COLLECTION_TYPE_MISMATCH", "This is a per-steamid collection. Use an endpoint instead.");
   }
   if (!access.hasSecretKey) {
-    throw new ProtocolError(403, "FORBIDDEN", "Appending to this collection requires the secret key.");
+    throw new ProtocolError(403, "FORBIDDEN", "This secret key does not have execute access to collections.");
   }
   const body = await readJsonValue(request);
   if (!isRecord(body) || Object.keys(body).length === 0) {
     throw new ProtocolError(400, "INVALID_BODY", "Body must be a non-empty JSON object.");
   }
-  const idempotencyKey = request.headers.get("Idempotency-Key");
-  const replays = idempotentAppends.get(ctx) ?? new Map<string, Record<string, unknown>>();
-  idempotentAppends.set(ctx, replays);
-  const replayKey = idempotencyKey === null ? null : `${collectionId}:${idempotencyKey}`;
-  const replay = replayKey === null ? undefined : replays.get(replayKey);
-  if (replay !== undefined) return jsonResponse(replay);
 
   const writer = await playerOf(ctx, request, url, body);
   takeAppendQuota(appendCountsOf(ctx), ctx.now(), collectionId, writer);
@@ -322,9 +311,7 @@ async function appendRecord(
   const storage = ctx.storage();
   const observed = await storage.records.getVersioned(collectionId, id);
   await storage.apply([{ op: "put", collection: collectionId, key: id, data: record }], { expectedVersions: expecting(collectionId, id, observed) });
-  const response = { ok: true, record };
-  if (replayKey !== null) replays.set(replayKey, response);
-  return jsonResponse(response);
+  return jsonResponse({ ok: true, record });
 }
 
 async function listRecords(ctx: ServerContext, collectionId: string): Promise<Response> {
@@ -337,11 +324,11 @@ async function readRecord(ctx: ServerContext, collectionId: string, id: string):
   if (record === null) {
     return jsonResponse({ error: { code: "NOT_FOUND", message: "Record not found." } }, 404);
   }
-  return jsonResponse({ ok: true, record });
+  return jsonResponse(record);
 }
 
 // Save slots: per-player named saves stored under `{steamId}_{recordId}`.
-const DEFAULT_SAVE_NAME = "Untitled save";
+const DEFAULT_SAVE_NAME = "Save";
 
 async function listSaves(
   ctx: ServerContext,
@@ -357,8 +344,14 @@ async function listSaves(
   const stored = await ctx.storage().records.list(collectionId);
   const records = stored
     .filter((record) => record.key.startsWith(prefix))
-    .map((record) => ({ id: record.key.slice(prefix.length), recordName: record.data["recordName"], data: record.data["data"] }));
-  return jsonResponse({ ok: true, maxRecords: Math.max(1, definition.maxRecords ?? 0), records });
+    .map((record) => ({
+      CreatedAt: record.data["createdAt"] ?? null,
+      IsLegacy: false,
+      RecordId: record.key.slice(prefix.length),
+      RecordName: record.data["recordName"],
+      UpdatedAt: record.data["updatedAt"] ?? null,
+    }));
+  return jsonResponse({ maxRecords: Math.max(1, definition.maxRecords ?? 0), records });
 }
 
 async function createSave(
@@ -379,7 +372,8 @@ async function createSave(
   await guardAccess(ctx, request, url, definition, "write", key, access, body);
   const storage = ctx.storage();
   const observed = await storage.records.getVersioned(collectionId, key);
-  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload ?? {} } }], {
+  const now = new Date(ctx.now()).toISOString();
+  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload ?? {}, createdAt: now, updatedAt: now } }], {
     expectedVersions: expecting(collectionId, key, observed),
   });
   return jsonResponse({ ok: true, recordId: id, recordName: name });
@@ -404,7 +398,8 @@ async function updateSave(
   if (existing === null) return recordNotFound();
   const name = typeof body["recordName"] === "string" ? body["recordName"] : existing["recordName"];
   const payload = isRecord(body["data"]) ? body["data"] : existing["data"];
-  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload } }], {
+  const now = new Date(ctx.now()).toISOString();
+  await storage.apply([{ op: "put", collection: collectionId, key, data: { recordName: name, data: payload, createdAt: existing["createdAt"] ?? now, updatedAt: now } }], {
     expectedVersions: expecting(collectionId, key, observed),
   });
   return jsonResponse({ ok: true, recordId: id, recordName: name });
@@ -428,36 +423,47 @@ async function deleteSave(
   return jsonResponse({ ok: true });
 }
 
-// Per-player stats: one record per steam id, with the latest seconds reported for each session.
-function numbersOf(value: unknown): Record<string, number> {
-  const out: Record<string, number> = {};
-  if (!isRecord(value)) return out;
-  for (const [sessionId, seconds] of Object.entries(value)) {
-    if (typeof seconds === "number") out[sessionId] = seconds;
-  }
-  return out;
+// Reference accrual (game-client-analytics-telemetry): credit the whole seconds elapsed since the previous
+// heartbeat, clamped to [0, 120]. A first heartbeat, or one whose record has no prior timestamp, credits 2.
+const HEARTBEAT_CREDIT_CAP_SECONDS = 120;
+const HEARTBEAT_FALLBACK_SECONDS = 2;
+
+function numberField(record: Record<string, unknown> | null, field: string): number {
+  const value = record?.[field];
+  return typeof value === "number" ? value : 0;
 }
 
 async function heartbeat(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   const body = await readJsonBody(request);
   const steamId = await playerOf(ctx, request, url, body);
   if (!STEAM_ID.test(steamId)) throw new ProtocolError(400, "INVALID_BODY", "A steam id is required.");
-  const sessionId = typeof body["sessionId"] === "string" ? body["sessionId"] : "default";
-  const sessionSeconds = typeof body["sessionSeconds"] === "number" && body["sessionSeconds"] >= 0 ? body["sessionSeconds"] : 0;
   const storage = ctx.storage();
   const observed = await storage.records.getVersioned("_stats", steamId);
   const existing = observed.data;
-  const sessions = { ...numbersOf(existing?.["sessions"]), [sessionId]: sessionSeconds };
-  const totalSeconds = Object.values(sessions).reduce((sum, seconds) => sum + seconds, 0);
-  const lastHeartbeat = new Date(ctx.now()).toISOString();
-  await storage.apply([{ op: "put", collection: "_stats", key: steamId, data: { sessions, totalSeconds, lastHeartbeat } }], {
+  const nowMs = ctx.now();
+  const lastHeartbeat = new Date(nowMs).toISOString();
+  const previousMs = numberField(existing, "lastHeartbeatUnixMs");
+  const credit =
+    previousMs > 0
+      ? Math.min(Math.max(Math.trunc((nowMs - previousMs) / 1000), 0), HEARTBEAT_CREDIT_CAP_SECONDS)
+      : HEARTBEAT_FALLBACK_SECONDS;
+  const totalSeconds = existing === null ? HEARTBEAT_FALLBACK_SECONDS : numberField(existing, "totalSeconds") + credit;
+  const stats = {
+    ...existing,
+    steamId,
+    lastHeartbeat,
+    lastHeartbeatUnixMs: nowMs,
+    totalSeconds,
+    ...(existing === null ? { firstSeen: lastHeartbeat } : {}),
+  };
+  await storage.apply([{ op: "put", collection: "_stats", key: steamId, data: stats }], {
     expectedVersions: expecting("_stats", steamId, observed),
   });
   return jsonResponse({
     ok: true,
     persisted: true,
-    projectId: ctx.options.projectId,
     steamId,
+    projectId: ctx.options.projectId,
     totalSeconds,
     lastHeartbeat,
   });
@@ -465,13 +471,13 @@ async function heartbeat(ctx: ServerContext, request: Request, url: URL): Promis
 
 async function readStats(ctx: ServerContext, steamId: string): Promise<Response> {
   const existing = await ctx.storage().records.get("_stats", steamId);
-  return jsonResponse({
-    ok: true,
-    projectId: ctx.options.projectId,
-    steamId,
-    totalSeconds: existing?.["totalSeconds"] ?? 0,
-    lastHeartbeat: existing?.["lastHeartbeat"] ?? null,
-  });
+  if (existing === null) {
+    return jsonResponse(
+      { error: { code: "NOT_FOUND", message: "No stats found for this player." } },
+      404,
+    );
+  }
+  return jsonResponse(existing);
 }
 
 async function recordEvent(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
@@ -501,7 +507,19 @@ async function recordEvent(ctx: ServerContext, request: Request, url: URL): Prom
 
 // Rules as the game client reads them. This server stores and serves the rules; it does not enforce them.
 export function rateLimitsResponse(ctx: ServerContext): Response {
-  return jsonResponse({ ok: true, projectId: ctx.options.projectId, rules: ctx.catalog.rateLimitRules }, 200);
+  return jsonResponse({ endpointRateLimits: {}, ok: true, projectId: ctx.options.projectId, rules: ctx.catalog.rateLimitRules, source: "store" }, 200);
+}
+
+// Storage refusals and body errors use the reference's flat envelope: { error: CODE, detail }. A body that cannot be
+// parsed carries the code alone, and an oversized body repeats its limit in detail and message.
+function storageErrorResponse(error: ProtocolError): Response {
+  if (error.code === "PAYLOAD_TOO_LARGE") {
+    return jsonResponse({ detail: error.message, error: "PAYLOAD_TOO_LARGE", message: error.message }, 413);
+  }
+  if (error.code === "INVALID_JSON" || (error.code === "INVALID_BODY" && error.message === BODY_NOT_OBJECT)) {
+    return jsonResponse({ error: "INVALID_BODY" }, 400);
+  }
+  return jsonResponse({ detail: error.message, error: error.code }, error.status);
 }
 
 // Entry point for everything under /storage/{project}/... after the project check. `rest` excludes the project.
@@ -517,6 +535,7 @@ export async function handleStorage(
     return await dispatchStorage(ctx, request, url, rest, family);
   } catch (error) {
     if (error instanceof StorageRefusal) return jsonResponse(error.body, error.status);
+    if (error instanceof ProtocolError) return storageErrorResponse(error);
     throw error;
   }
 }
@@ -552,6 +571,9 @@ async function dispatchStorage(
   }
 
   const collectionId = pathSegment(head);
+  if (collectionId.includes("/") || collectionId.includes("\\") || collectionId === "." || collectionId === "..") {
+    return jsonResponse({ detail: "Collection not found.", error: "NOT_FOUND" }, 404);
+  }
   if (rest.length === 2 && second === "append" && method === "POST") {
     return appendRecord(ctx, request, url, collectionId, access);
   }

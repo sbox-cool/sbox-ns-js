@@ -129,21 +129,6 @@ function validateRoutes(step: Record<string, unknown>, path: string, visible: re
   }
 }
 
-// Input schema check for endpoint requests: an object with optional typed properties and required names.
-export function validateInput(schema: unknown, input: Record<string, unknown>, ns: Ns): void {
-  if (!isObject(schema)) return;
-  const properties = isObject(schema["properties"]) ? schema["properties"] : {};
-  const required = Array.isArray(schema["required"]) ? schema["required"] : [];
-  for (const name of required) {
-    if (typeof name === "string" && input[name] === undefined) ns.fail("INVALID_INPUT", `Missing required field "${name}".`, 400);
-  }
-  for (const [name, spec] of Object.entries(properties)) {
-    const value = input[name];
-    if (value === undefined || !isObject(spec) || typeof spec["type"] !== "string") continue;
-    if (!matchesType(spec["type"], value)) ns.fail("INVALID_INPUT", `Field "${name}" must be a ${spec["type"]}.`, 400);
-  }
-}
-
 function matchesType(type: string, value: unknown): boolean {
   switch (type) {
     case "string":
@@ -205,10 +190,8 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
   validateSteps(doc["steps"] ?? [], "endpoint.steps", new Set(), []);
   const response = requireObject(doc["response"] ?? { status: 200, body: {} }, "endpoint.response");
   const steps = (doc["steps"] ?? []) as readonly StepDef[];
-  const inputSchema = doc["input"];
 
   const handler: EndpointHandler = (req: EndpointRequest, ns: Ns) => {
-    validateInput(inputSchema, req.input, ns);
     const scope: Record<string, unknown> = {
       input: req.input,
       steamId: req.player?.steamId ?? "anonymous",

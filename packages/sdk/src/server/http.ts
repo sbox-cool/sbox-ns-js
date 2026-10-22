@@ -6,14 +6,26 @@ import { StorageError } from "../storage/errors.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 
-// 1 MiB of JSON text. Bodies are measured in UTF-16 code units, which bounds the byte size from above.
-const MAX_JSON_BODY_CHARS = 1024 * 1024;
+// Largest request body in bytes per route group, as the reference server sets them: game and auth-session routes
+// 256 KiB, management 8 MiB, everything else 1 MiB.
+const DATA_PLANE_BODY_BYTES = 256 * 1024;
+const MANAGEMENT_BODY_BYTES = 8 * 1024 * 1024;
+const DEFAULT_BODY_BYTES = 1024 * 1024;
+
+export function bodyLimitFor(url: URL): number {
+  const parts = url.pathname.split("/").filter((part) => part.length > 0);
+  if (parts[1] === "manage") return MANAGEMENT_BODY_BYTES;
+  const gameRoute = parts[0] === "v1" || parts[0] === "v3" || parts[0] === "api" || parts[0] === "pages";
+  if (gameRoute || parts[1] === "auth-sessions" || parts[1] === "sessions") return DATA_PLANE_BODY_BYTES;
+  return DEFAULT_BODY_BYTES;
+}
 
 export interface ErrorDescription {
   status: number;
   code: string;
   message: string;
   security?: Readonly<Record<string, unknown>>;
+  details?: Readonly<Record<string, unknown>>;
 }
 
 export function errorBody(code: string, message: string): Record<string, unknown> {
@@ -21,9 +33,14 @@ export function errorBody(code: string, message: string): Record<string, unknown
 }
 
 export function errorResponse(description: ErrorDescription): Response {
+  return jsonResponse(describedErrorBody(description), description.status);
+}
+
+export function describedErrorBody(description: ErrorDescription): Record<string, unknown> {
   const body = errorBody(description.code, description.message);
+  if (description.details !== undefined) Object.assign(body, description.details);
   if (description.security !== undefined) body.security = description.security;
-  return jsonResponse(body, description.status);
+  return body;
 }
 
 // Maps any thrown value to a status and a code. Internal details never reach the caller.
@@ -31,7 +48,7 @@ export function describeError(error: unknown): ErrorDescription {
   if (error instanceof ProtocolError) {
     return { status: error.status, code: error.code, message: error.message, security: error.security };
   }
-  if (error instanceof ScriptFailure) return { status: error.status, code: error.code, message: error.message };
+  if (error instanceof ScriptFailure) return { status: error.status, code: error.code, message: error.message, details: error.details };
   if (error instanceof FetchError) return { status: 502, code: error.code, message: error.message };
   if (error instanceof StorageError) return { status: error.status, code: error.code, message: error.message };
   if (error instanceof RunCancelled) return { status: 499, code: "REQUEST_CANCELLED", message: error.message };
@@ -49,13 +66,14 @@ export function safeEqual(a: string, b: string): boolean {
   return difference === 0;
 }
 
-// Reads a request body as text under the JSON size limit.
+// Reads a request body as text under the body limit of its route group.
 export async function readBodyText(request: Request): Promise<string> {
-  const text = await request.text();
-  if (text.length > MAX_JSON_BODY_CHARS) {
-    throw new ProtocolError(413, "BODY_TOO_LARGE", "The request body is too large.");
+  const limit = bodyLimitFor(new URL(request.url));
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength > limit) {
+    throw new ProtocolError(413, "PAYLOAD_TOO_LARGE", `Request body exceeds the ${limit}-byte limit for this route.`);
   }
-  return text;
+  return new TextDecoder().decode(bytes);
 }
 
 // Reads a JSON body of any shape. An empty body is undefined.
@@ -69,11 +87,14 @@ export async function readJsonValue(request: Request): Promise<unknown> {
   }
 }
 
+// The message for a JSON body that parses but is not an object. Storage routes match on it to drop the detail.
+export const BODY_NOT_OBJECT = "The request body must be a JSON object.";
+
 // Reads a JSON object body. An empty body is an empty object.
 export async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
   const parsed = await readJsonValue(request);
   if (parsed === undefined) return {};
-  if (!isRecord(parsed)) throw new ProtocolError(400, "INVALID_BODY", "The request body must be a JSON object.");
+  if (!isRecord(parsed)) throw new ProtocolError(400, "INVALID_BODY", BODY_NOT_OBJECT);
   return parsed;
 }
 

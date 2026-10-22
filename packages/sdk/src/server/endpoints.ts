@@ -12,11 +12,11 @@ import { withoutReservedKeys } from "../protocol/payload.js";
 import { envelopeKindOf, securityDenial, type EnvelopeKind } from "../protocol/security.js";
 import { verifyAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
-import { jsonResponse } from "../util/http.js";
+import { jsonResponse, traceIdentifier } from "../util/http.js";
 import { identityOptionsFor, type ServerContext } from "./context.js";
 import { KeyRefusal } from "./auth-failure.js";
 import { targetsNext } from "./publish-target.js";
-import { credentialsOf, describeError, errorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
+import { credentialsOf, describeError, describedErrorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
 import type { LoadedRequestKey } from "../protocol/crypto.js";
 import type { EndpointHandler, WorkflowFunction } from "../endpoint/types.js";
 import type { ExecutionMode } from "../endpoint/execution.js";
@@ -83,11 +83,21 @@ export async function handleEndpoint(
   if (access === null) throw new KeyRefusal();
   const state: CallState = { library: false, requestId: null, responseKey: null };
   try {
-    const body = request.method === "GET" ? null : await readJsonBody(request);
+    const body = request.method === "GET" ? null : await endpointBody(request);
     state.library = isLibraryCaller(request.headers, body);
     return await runCall(ctx, request, url, pathSlug, body, access.hasSecretKey, state);
   } catch (error) {
     return failureResponse(error, state);
+  }
+}
+
+// The reference runs an endpoint with no input when its body is not valid JSON. Oversized bodies still fail.
+async function endpointBody(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    return await readJsonBody(request);
+  } catch (error) {
+    if (error instanceof ProtocolError && error.code === "INVALID_JSON") return null;
+    throw error;
   }
 }
 
@@ -97,16 +107,15 @@ async function failureResponse(error: unknown, state: CallState): Promise<Respon
   const description = describeError(error);
   if (!state.library) {
     if (state.responseKey === null) return errorResponse(description);
-    const body = errorBody(description.code, description.message);
-    if (description.security !== undefined) body.security = description.security;
-    return jsonResponse(await sealV2Response(state.responseKey, body), description.status);
+    return jsonResponse(await sealV2Response(state.responseKey, describedErrorBody(description)), description.status);
   }
   const body = libraryErrorBody({
     status: description.status,
     code: description.code,
     message: description.message,
-    requestId: state.requestId ?? crypto.randomUUID(),
+    requestId: state.requestId ?? traceIdentifier(),
     security: description.security,
+    details: description.details,
   });
   if (state.responseKey === null) return jsonResponse(body, 200);
   return jsonResponse(await sealV2Response(state.responseKey, body), 200);
@@ -236,7 +245,8 @@ async function runCall(
       globals: options.globals ?? {},
       secrets: options.secrets ?? NO_SECRETS,
       now: ctx.now,
-      trackedFields: (collection) => trackedFieldsOf(view.catalog, collection),
+      trackedFields: (collection) =>
+        options.settings.legacyPlayerProjections === true ? trackedFieldsOf(view.catalog, collection) : [],
       log: options.log ?? (() => undefined),
       signal: request.signal,
     },
