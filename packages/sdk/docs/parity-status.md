@@ -66,3 +66,19 @@ The corpus does not measure these. They are listed so they are not mistaken for 
 - Auto-test (`POST /v3/manage/{project}/auto-test`) runs each endpoint as a preview and discards its writes. When one auto-test covers several endpoints, a later endpoint therefore does not see an earlier endpoint's preview writes, as it would with the reference's in-memory run cache.
 - `GET /v3/server-info` advertises only the capabilities the SDK routes: records, global-records, endpoints, queries, game-values, rate-limits, auth-sessions, library-error-envelope, management-sync-jobs. Not advertised because not routed: workflows, analytics, analytics-batch, package-sync, https-tunnel, api-root, media, endpoint-js. The reference's server-info `kind`, `version`, `database` and `compat` fields are not returned.
 - `PUT /v3/manage/{project}/settings` changes the security settings the protocol reads from the next request on, and the signed config follows at its next build. The change is held in memory by the server process, not persisted, so a restart returns to the settings the server was created with. The reference persists it. Stored keys follow the reference's `ManagementSettings.Apply`; `enabled`, `playerKeyMode` and the revision keys are view-only and refuse a different value with `SETTING_NOT_STORED`. Key rotation is not in the management API, as in the reference.
+
+## Engine leg coverage (ci-only)
+
+Run 39764111378 on windows-latest (sbox-ns-js `a0a2516`, sbox-network-storage-server `976cff7`, sbox-public `468c55e8`, dedicated server built from source) passed for `main` and `r427072`: library load, HTTP allowed, endpoint call, endpoint call with input, game values, secret-key endpoint, encrypted calls, and plain/encrypted switching through `PUT /v3/manage/{project}/settings`. Both refs resolved to library commit `ddf9b617`, the r427072 tag, so this is one library revision run twice. The result is `ci-only`. No native editor pass is claimed.
+
+Not covered by that run:
+
+- Sessions (session login and session-bound calls). The dedicated driver has no session step.
+- Host-proxy with a second account.
+- v2 encrypted modes. The SDK refuses them without a request key, and the run does not exercise them.
+- Rate limit. A `--server-url` server cannot be restarted with a low limit.
+- Encryption 409 rows. An attached server's request log is not reachable from the harness.
+- Key rotation in attached mode.
+- Tables. The collection DSL does not implement them.
+- Definition-level findings other than step-level ones, which are rejected at sync.
+- Native editor pass.
