@@ -148,8 +148,12 @@ dotnet "$parity_dll" run --target "http://127.0.0.1:$sdk_port" --project-id "$sd
 kill "$sdk_pid" 2>/dev/null || true; wait "$sdk_pid" 2>/dev/null || true; sdk_pid=''
 
 diff_status=0
-dotnet "$parity_dll" diff --stable "$out/ref-results.json" --candidate "$out/sdk-results.json" \
-  --allow "$reference/tests/parity/intentional-differences.json" > "$out/diff.log" 2>&1 || diff_status=$?
+sdk_allow="$root/packages/sdk/test/parity/sdk-intentional-differences.json"
+allow="$out/allow.json"
+# The reference allow-list plus the SDK's own entries, one file for diff.
+node -e 'const fs = require("fs"); const [ref, sdk, dest] = process.argv.slice(1); const r = JSON.parse(fs.readFileSync(ref, "utf8")); const s = JSON.parse(fs.readFileSync(sdk, "utf8")); fs.writeFileSync(dest, JSON.stringify({ schemaVersion: r.schemaVersion, differences: [...r.differences, ...s.differences] }, null, 2));' \
+  "$reference/tests/parity/intentional-differences.json" "$sdk_allow" "$allow"
+dotnet "$parity_dll" diff --stable "$out/ref-results.json" --candidate "$out/sdk-results.json" --allow "$allow" > "$out/diff.log" 2>&1 || diff_status=$?
 {
   echo "reference: $(git -C "$reference" rev-parse --short HEAD 2>/dev/null || echo unknown) ($reference)"
   echo "sdk: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown) ($root)"

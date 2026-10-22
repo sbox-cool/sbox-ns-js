@@ -1,3 +1,4 @@
+import { ScriptFailure } from "../endpoint/runtime.js";
 import { ProtocolError } from "../protocol/errors.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
@@ -14,15 +15,16 @@ import {
   upsertGameValues,
   writeCompiled,
   type Compiled,
+  type EndpointEntry,
   type RecordCheck,
   type ResourceKind,
 } from "./catalog.js";
-import type { ServerContext } from "./context.js";
-import { authorize, handleEndpoint } from "./endpoints.js";
+import type { RuntimeView, ServerContext } from "./context.js";
+import { authorize, executeEndpoint, resolveEndpoint } from "./endpoints.js";
 import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
 import { managementSettingsView } from "./management-settings.js";
-import { pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
-import { PUBLISH_TARGET_HEADER, decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
+import { describeError, describedErrorBody, pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
+import { decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
 import { parseQuery, type QueryDefinition } from "./query-routes.js";
 import { SYNC_JOB_MESSAGE_ACCEPTED, startEndpointSync, writeEndpointBatch } from "./sync-jobs.js";
 import { upgradeSource } from "./source-upgrade.js";
@@ -31,21 +33,6 @@ import { upgradeSource } from "./source-upgrade.js";
 // calls with its public key. Section writes are all-or-nothing: a batch that fails to compile changes nothing.
 
 const KINDS: readonly ResourceKind[] = ["endpoints", "collections", "workflows"];
-// Fields of the editor's game package record that the server keeps. Raw editor payloads are not stored.
-const GAME_PACKAGE_FIELDS = [
-  "packageId",
-  "packageIdent",
-  "packageTitle",
-  "orgIdent",
-  "packageType",
-  "runtimeClientType",
-  "isEditorContext",
-  "isPublishedGameBundle",
-  "currentRevisionId",
-  "latestRevisionId",
-  "publishStatus",
-] as const;
-
 // One record of a section: the compiled form, or the check it failed.
 interface SectionItem {
   readonly slot: number;
@@ -62,15 +49,6 @@ interface Section {
   readonly compiled: readonly Compiled[];
   readonly ok: boolean;
   readonly message: string | null;
-}
-
-interface TestResult {
-  id: string;
-  endpoint: string;
-  method: "POST";
-  ok: boolean;
-  errors: string[];
-  result: { status: number; body: unknown };
 }
 
 function noRoute(): UnknownRoute {
@@ -301,10 +279,7 @@ export async function handleManage(
   if (head === "package-sync" && rest.length === 1 && method === "POST") return packageSync(ctx, request);
   if (head === "game-package" && rest.length === 1 && method === "GET") {
     const gamePackage = ctx.catalog.gamePackage;
-    if (gamePackage === null) {
-      throw new ProtocolError(404, "NOT_FOUND", "No game package has been synced for this project.");
-    }
-    return jsonResponse({ ok: true, gamePackage }, 200);
+    return jsonResponse({ ok: true, gamePackage: gamePackage === null ? null : withUnixTimestamps(gamePackage) }, 200);
   }
   if (head === "source-upgrade" && rest.length === 1 && method === "POST") return sourceUpgrade(ctx, request);
   if (head === "auto-test" && rest.length === 1 && method === "POST") return autoTest(ctx, request, url);
@@ -313,9 +288,18 @@ export async function handleManage(
   }
   if (head === "tests" && rest.length === 1 && method === "PUT") return putTests(ctx, request);
   if (head === "rate-limit-rules" && rest.length === 1 && method === "GET") {
-    return jsonResponse({ ok: true, rules: ctx.catalog.rateLimitRules }, 200);
+    return jsonResponse(
+      { ok: true, projectId: ctx.options.projectId, source: "configuration", endpointRateLimits: null, rules: ctx.catalog.rateLimitRules },
+      200,
+    );
   }
-  if (head === "rate-limit-rules" && rest.length === 1 && method === "PUT") return putRateLimits(ctx, request);
+  if (head === "rate-limit-rules" && rest.length === 1 && (method === "PUT" || method === "POST")) {
+    return putRateLimits(ctx, request);
+  }
+  if (head === "rate-limit-rules" && rest.length === 1 && method === "DELETE") {
+    ctx.catalog.rateLimitRules = [];
+    return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "delete" }, 200);
+  }
   if (head === "queries") return queriesRoute(ctx, request, rest);
   const kind = kindOfPath(head);
   if (kind !== null) return kindRoute(ctx, request, url, kind, rest);
@@ -517,33 +501,29 @@ async function queriesRoute(ctx: ServerContext, request: Request, rest: readonly
   if (rest.length === 1 && method === "POST") {
     const queries = parseQueries(await readJsonValue(request));
     for (const query of queries) ctx.catalog.queries.set(query.id, query);
-    return jsonResponse({ ok: true, count: queries.length }, 200);
-  }
-  if (rest.length === 1 && method === "PUT") {
-    const queries = parseQueries(await readJsonValue(request));
-    ctx.catalog.queries.clear();
-    for (const query of queries) ctx.catalog.queries.set(query.id, query);
-    return jsonResponse({ ok: true, count: queries.length }, 200);
+    return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "upsert" }, 200);
   }
   const id = rest[1];
   if (rest.length === 2 && id !== undefined && method === "DELETE") {
     const key = pathSegment(id);
-    if (!ctx.catalog.queries.delete(key)) {
-      throw new ProtocolError(404, "NOT_FOUND", `No query named "${key}".`);
-    }
-    return jsonResponse({ ok: true, id: key }, 200);
+    ctx.catalog.queries.delete(key);
+    return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "delete", resourceId: key }, 200);
   }
   throw noRoute();
 }
 
 async function putRateLimits(ctx: ServerContext, request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const rules = body["rules"];
+  const root = await readJsonValue(request);
+  // The documented shape wraps the array ({rules: [...]}); the store keeps the bare array.
+  const rules = isRecord(root) && "rules" in root ? root["rules"] : root;
   if (!Array.isArray(rules) || !rules.every(isRecord)) {
-    throw new ProtocolError(400, "VALIDATION_FAILED", "rules must be an array of rule objects.");
+    return jsonResponse(
+      { ok: false, resourceKind: "rate-limit-rules", error: { code: "VALIDATION_FAILED", message: "rules must be an array of rule objects." } },
+      400,
+    );
   }
   ctx.catalog.rateLimitRules = rules;
-  return jsonResponse({ ok: true, count: rules.length }, 200);
+  return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "upsert" }, 200);
 }
 
 async function putTests(ctx: ServerContext, request: Request): Promise<Response> {
@@ -558,39 +538,106 @@ async function putTests(ctx: ServerContext, request: Request): Promise<Response>
   return jsonResponse({ ok: true, count: tests.length }, 200);
 }
 
-// Runs one test case through the real endpoint handler, in process, with the secret key.
-async function runTest(
-  ctx: ServerContext,
-  url: URL,
-  secret: string,
-  test: Record<string, unknown>,
-  next: boolean,
-): Promise<TestResult> {
-  const id = typeof test["id"] === "string" ? test["id"] : "";
-  const endpoint = typeof test["endpoint"] === "string" ? test["endpoint"] : "";
-  const input = isRecord(test["input"]) ? test["input"] : {};
-  const expect = isRecord(test["expect"]) ? test["expect"] : {};
-  const wanted = typeof expect["status"] === "number" ? expect["status"] : 200;
-  const call = new Request(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-secret-key": secret, ...(next ? { [PUBLISH_TARGET_HEADER]: "next" } : {}) },
-    body: JSON.stringify(input),
-  });
-  const response = await handleEndpoint(ctx, call, url, endpoint);
-  const body: unknown = await response.json().catch(() => null);
-  const errors = response.status === wanted ? [] : [`Expected status ${wanted} but got ${response.status}.`];
-  return { id, endpoint, method: "POST", ok: errors.length === 0, errors, result: { status: response.status, body } };
-}
+// The reference runs each endpoint in process as a synthetic player and reports what happened. The auto-test
+// runs with the secret key already checked by the management route.
+const AUTO_TEST_STEAM_ID = "76561198000000000";
+const AUTO_TEST_UNSUPPORTED = "The native executor does not support this endpoint definition.";
 
 async function autoTest(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
-  const secret = requireSecret(ctx, request);
   const body = await readJsonBody(request);
-  const slug = typeof body["slug"] === "string" ? body["slug"] : null;
-  const selected = ctx.catalog.tests.filter((test) => slug === null || test["endpoint"] === slug);
-  const results: TestResult[] = [];
-  for (const test of selected) results.push(await runTest(ctx, url, secret, test, targetsNext(request, url)));
-  const failed = results.filter((result) => !result.ok).length;
-  return jsonResponse({ ok: failed === 0, passed: results.length - failed, failed, results }, 200);
+  const requestedValue = body["slug"];
+  const requested = typeof requestedValue === "string" && requestedValue.trim() !== "" ? requestedValue : null;
+  const view = ctx.view(targetsNext(request, url));
+  // The reference lists endpoints in ordinal slug order.
+  const selected = [...view.catalog.endpoints]
+    .filter(([slug]) => requested === null || slug.toLowerCase() === requested.toLowerCase())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  if (requested !== null && selected.length === 0) {
+    throw new ProtocolError(400, "ENDPOINT_NOT_FOUND", `Endpoint '${requested}' was not found.`);
+  }
+  const results: Record<string, unknown>[] = [];
+  for (const [slug, entry] of selected) results.push(await autoTestEndpoint(ctx, view, slug, entry, request.signal));
+  if (requested !== null) return jsonResponse({ ok: true, ...results[0] }, 200);
+  const passed = results.filter((result) => result["passed"] === true).length;
+  return jsonResponse({ ok: true, results, summary: { total: results.length, passed, failed: results.length - passed } }, 200);
+}
+
+async function autoTestEndpoint(
+  ctx: ServerContext,
+  view: RuntimeView,
+  slug: string,
+  entry: EndpointEntry,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const report = {
+    name: `Auto-test ${slug}`,
+    endpoint: slug,
+    method: entry.compiled.method,
+    deprecated: entry.stored["deprecated"] === true,
+    warnings: [],
+  };
+  const target = resolveEndpoint(ctx, view.catalog, slug);
+  if (target === null) return { ...report, passed: false, errors: [AUTO_TEST_UNSUPPORTED], result: null };
+  try {
+    const run = await executeEndpoint(ctx, view, target, {
+      slug,
+      method: entry.compiled.method,
+      input: autoTestInput(entry.stored),
+      steamId: AUTO_TEST_STEAM_ID,
+      signal,
+      live: false,
+    });
+    const passed = run.status < 300;
+    return {
+      ...report,
+      passed,
+      errors: passed ? [] : [`Endpoint returned HTTP ${run.status}.`],
+      result: { status: run.status, body: run.body },
+    };
+  } catch (error) {
+    if (!(error instanceof ProtocolError || error instanceof ScriptFailure)) {
+      return { ...report, passed: false, errors: [error instanceof Error ? error.message : String(error)], result: null };
+    }
+    const description = describeError(error);
+    const failure = describedErrorBody(description);
+    delete failure["ok"];
+    return {
+      ...report,
+      passed: false,
+      errors: [`Endpoint returned HTTP ${description.status}.`],
+      result: { status: description.status, body: failure },
+    };
+  }
+}
+
+// Each declared input takes its default, or a placeholder of its type, as the reference runner builds it.
+function autoTestInput(record: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const schema = record["input"];
+  const properties = isRecord(schema) && isRecord(schema["properties"]) ? schema["properties"] : {};
+  return Object.fromEntries(
+    Object.entries(properties).map(([name, prop]) => {
+      const spec = isRecord(prop) ? prop : {};
+      return [name, "default" in spec ? spec["default"] : autoTestDefault(spec["type"])];
+    }),
+  );
+}
+
+function autoTestDefault(type: unknown): unknown {
+  switch (type) {
+    case "string":
+      return "test";
+    case "integer":
+    case "number":
+      return 1;
+    case "boolean":
+      return true;
+    case "array":
+      return [];
+    case "object":
+      return {};
+    default:
+      return null;
+  }
 }
 
 async function sourceUpgrade(ctx: ServerContext, request: Request): Promise<Response> {
@@ -615,25 +662,53 @@ function syncJobRoute(ctx: ServerContext, jobId: string): Response {
   return jsonResponse({ ok: false, error: "JOB_NOT_FOUND" }, 404);
 }
 
+// The stored package plus the Unix-second fields the reference derives from its ISO timestamps.
+function withUnixTimestamps(gamePackage: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...gamePackage,
+    revisionFirstSyncedAtUnix: unixSeconds(gamePackage["revisionPublishedAt"]),
+    lastSyncedAtUnix: unixSeconds(gamePackage["lastSyncedAt"]),
+  };
+}
+
+function unixSeconds(value: unknown): number | null {
+  const ms = typeof value === "string" ? Date.parse(value) : Number.NaN;
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+}
+
+// Merges the body over the stored package, as the reference does. A changed revision resets the publish anchor and
+// promotes the staged revision; a first sync has no earlier revision to replace.
 async function packageSync(ctx: ServerContext, request: Request): Promise<Response> {
   const body = await readJsonBody(request);
-  const packageIdent = body["packageIdent"];
-  const currentRevisionId = body["currentRevisionId"];
-  if (typeof packageIdent !== "string" || packageIdent === "" || typeof currentRevisionId !== "number") {
-    throw new ProtocolError(400, "VALIDATION_FAILED", "packageIdent and currentRevisionId are required.");
-  }
-  const gamePackage: Record<string, unknown> = { projectId: ctx.options.projectId };
-  for (const field of GAME_PACKAGE_FIELDS) {
-    if (Object.hasOwn(body, field)) gamePackage[field] = body[field];
-  }
-  const previous = ctx.catalog.gamePackage?.["currentRevisionId"];
-  const revisionChanged = typeof previous === "number" && previous !== currentRevisionId;
+  const previousId = ctx.catalog.gamePackage?.["currentRevisionId"];
+  const previousRevisionId = typeof previousId === "number" ? previousId : null;
+  const now = new Date(ctx.now()).toISOString();
+  const gamePackage: Record<string, unknown> = {
+    ...ctx.catalog.gamePackage,
+    ...body,
+    lastSyncedAt: now,
+    publishStatus: "published",
+  };
+  delete gamePackage["revisionFirstSyncedAtUnix"];
+  delete gamePackage["lastSyncedAtUnix"];
+  const currentId = gamePackage["currentRevisionId"];
+  const currentRevisionId = typeof currentId === "number" ? currentId : null;
+  const revisionChanged = previousRevisionId !== null && currentRevisionId !== null && previousRevisionId !== currentRevisionId;
+  if (revisionChanged || !("revisionPublishedAt" in gamePackage)) gamePackage["revisionPublishedAt"] = now;
   ctx.catalog.gamePackage = gamePackage;
-  // Only a changed revision promotes the staged revision; a first sync has no earlier revision to replace.
   const promotedRevisionOverrides = revisionChanged
     ? promoteStaged(ctx.catalog, ctx.options.parseYaml)
     : { endpointCount: 0, collectionCount: 0, promoted: false };
-  return jsonResponse({ ok: true, gamePackage, revisionChanged, promotedRevisionOverrides }, 200);
+  return jsonResponse(
+    {
+      ok: true,
+      gamePackage: withUnixTimestamps(gamePackage),
+      previousRevisionId,
+      revisionChanged,
+      promotedRevisionOverrides,
+    },
+    200,
+  );
 }
 
 async function revisionInit(ctx: ServerContext, request: Request, url: URL): Promise<Response> {

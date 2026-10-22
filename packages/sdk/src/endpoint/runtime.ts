@@ -14,18 +14,27 @@ import {
 import type { EndpointGlobal, EndpointHandler, EndpointRequest, FetchOptions, FetchResponse, Ns, WorkflowFunction } from "./types.js";
 import { RUN_INTERNALS, type ExecutionMode, type RunInternals } from "./execution.js";
 
-// Thrown by ns.fail(). The backend maps it to a status and an error body.
+// Thrown by ns.fail(). The backend maps it to a status and an error body. `details` join the body; `errorFields`
+// join the `error` object (the reference's step failures carry docsUrl and step there).
 export class ScriptFailure extends Error {
   readonly code: string;
   readonly status: number;
   readonly details: Readonly<Record<string, unknown>>;
+  readonly errorFields: Readonly<Record<string, unknown>> | undefined;
 
-  constructor(code: string, message: string, status: number, details: Readonly<Record<string, unknown>> = {}) {
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    details: Readonly<Record<string, unknown>> = {},
+    errorFields?: Readonly<Record<string, unknown>>,
+  ) {
     super(message);
     this.name = "ScriptFailure";
     this.code = code;
     this.status = status;
     this.details = details;
+    this.errorFields = errorFields;
   }
 }
 

@@ -13,7 +13,7 @@ import { envelopeKindOf, securityDenial, type EnvelopeKind } from "../protocol/s
 import { verifyAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse, traceIdentifier } from "../util/http.js";
-import { identityOptionsFor, type ServerContext } from "./context.js";
+import { identityOptionsFor, type RuntimeView, type ServerContext } from "./context.js";
 import { KeyRefusal } from "./auth-failure.js";
 import { targetsNext } from "./publish-target.js";
 import { credentialsOf, describeError, describedErrorBody, errorResponse, readJsonBody, safeEqual } from "./http.js";
@@ -28,7 +28,7 @@ const SHELL_KEYS = ["security", "_endpointSlug", "endpoint"] as const;
 const NO_SECRETS: SecretStore = { get: () => null };
 
 // Static endpoints from ServerOptions first, then the endpoints the editor pushed (compiled from DSL documents).
-function resolveEndpoint(
+export function resolveEndpoint(
   ctx: ServerContext,
   catalog: Catalog,
   slug: string,
@@ -116,6 +116,7 @@ async function failureResponse(error: unknown, state: CallState): Promise<Respon
     requestId: state.requestId ?? traceIdentifier(),
     security: description.security,
     details: description.details,
+    errorFields: description.errorFields,
   });
   if (state.responseKey === null) return jsonResponse(body, 200);
   return jsonResponse(await sealV2Response(state.responseKey, body), 200);
@@ -148,7 +149,6 @@ async function runCall(
       `Endpoint "${slug}" requires a Network Storage secret key. Send it in the x-secret-key header.`,
     );
   }
-  const handler = target.handler;
   const nowMs = ctx.now();
 
   const headerCredentials = credentialsOf(request, url, envelope ?? body);
@@ -228,13 +228,49 @@ async function runCall(
       ? withoutReservedKeys(omitKeys(Object.fromEntries(url.searchParams), SHELL_KEYS))
       : withoutReservedKeys(omitKeys(commandBody ?? {}, SHELL_KEYS));
 
+  const run = await executeEndpoint(ctx, view, target, {
+    slug,
+    method: request.method === "GET" ? "GET" : "POST",
+    input,
+    steamId: identity.steamId === "anonymous" ? null : identity.steamId,
+    signal: request.signal,
+    live: true,
+  });
+  if (state.responseKey === null) return jsonResponse(run.body, run.status);
+  return jsonResponse(await sealV2Response(state.responseKey, run.body), run.status);
+}
+
+export interface EndpointCall {
+  readonly slug: string;
+  readonly method: "GET" | "POST";
+  readonly input: Record<string, unknown>;
+  // The steam id the call acts as. Null is anonymous.
+  readonly steamId: string | null;
+  readonly signal: AbortSignal;
+  // Live calls apply their writes. A preview (the auto-test) runs them in memory only, as the reference's non-live runs do.
+  readonly live: boolean;
+}
+
+export interface EndpointRun {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+}
+
+// Runs a resolved endpoint in process and applies its writes. Returns the status and success body the endpoint declares.
+export async function executeEndpoint(
+  ctx: ServerContext,
+  view: RuntimeView,
+  target: { readonly handler: EndpointHandler; readonly execution: ExecutionMode },
+  call: EndpointCall,
+): Promise<EndpointRun> {
+  const { options } = ctx;
   const outcome = await runEndpoint(
-    handler,
+    target.handler,
     {
-      input,
-      player: identity.steamId === "anonymous" ? null : { steamId: identity.steamId },
-      method: request.method === "GET" ? "GET" : "POST",
-      endpoint: slug,
+      input: call.input,
+      player: call.steamId === null ? null : { steamId: call.steamId },
+      method: call.method,
+      endpoint: call.slug,
       revision: null,
     },
     {
@@ -248,19 +284,15 @@ async function runCall(
       trackedFields: (collection) =>
         options.settings.legacyPlayerProjections === true ? trackedFieldsOf(view.catalog, collection) : [],
       log: options.log ?? (() => undefined),
-      signal: request.signal,
+      signal: call.signal,
     },
   );
-  if (outcome.writes.length > 0) {
+  if (call.live && outcome.writes.length > 0) {
     await view.storage.apply(outcome.writes, { expectedVersions: outcome.expectedVersions });
   }
-
   // Declarative endpoints return a DslResponse, which carries the HTTP status the document declares.
   const response = outcome.value instanceof DslResponse ? outcome.value : null;
-  const success = successBody(response === null ? outcome.value : response.body);
-  const status = response?.status ?? 200;
-  if (state.responseKey === null) return jsonResponse(success, status);
-  return jsonResponse(await sealV2Response(state.responseKey, success), status);
+  return { status: response?.status ?? 200, body: successBody(response === null ? outcome.value : response.body) };
 }
 
 // The route slug, or the one the body claims for a plain call. Encrypted bodies claim it inside the envelope,

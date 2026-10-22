@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "differences": [
+    {
+      "scenario": "manage-push-all",
+      "step": "preflight-invalid",
+      "path": "body:$.endpoints.results[0].diagnostics[0].message",
+      "reason": "Unmatchable: the reference reports the .NET YamlDotNet parser's message for malformed YAML; the SDK reports its own YAML parser's message. Both are the same diagnostic (COLLECTION_NAME_REQUIRED and the failure status still match); the parser wording is the implementation's."
+    },
+    {
+      "scenario": "errors-invalid-input",
+      "step": "deploy-canary",
+      "path": "body:$.owner",
+      "reason": "Unmatchable: the owner field identifies the implementation serving the probe. The reference answers \".NET native\"; the SDK answers \"@sbox-ns/sdk\". The probe's ok and probe fields match."
+    }
+  ]
+}

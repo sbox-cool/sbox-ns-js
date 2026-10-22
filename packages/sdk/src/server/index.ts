@@ -80,7 +80,7 @@ async function route(ctx: ServerContext, request: Request): Promise<Response> {
 
   // Deploy probe: answers for any project, before the project check.
   if (family === "storage" && project === "deploy-canary" && rest[0] === "ping") {
-    return jsonResponse({ ok: true, owner: "@sbox-ns/sdk", probe: "deploy-canary" });
+    return jsonResponse({ ok: true, owner: "@sbox-ns/sdk", probe: "deploy-canary" }, 200, { "cache-control": "no-store" });
   }
   if (family === "security-config" && rest.length === 0 && method === "GET" && project !== ctx.options.projectId) {
     return securityConfigMissing(project);

@@ -26,6 +26,7 @@ export interface ErrorDescription {
   message: string;
   security?: Readonly<Record<string, unknown>>;
   details?: Readonly<Record<string, unknown>>;
+  errorFields?: Readonly<Record<string, unknown>>;
 }
 
 export function errorBody(code: string, message: string): Record<string, unknown> {
@@ -38,6 +39,7 @@ export function errorResponse(description: ErrorDescription): Response {
 
 export function describedErrorBody(description: ErrorDescription): Record<string, unknown> {
   const body = errorBody(description.code, description.message);
+  if (description.errorFields !== undefined) Object.assign(body["error"] as Record<string, unknown>, description.errorFields);
   if (description.details !== undefined) Object.assign(body, description.details);
   if (description.security !== undefined) body.security = description.security;
   return body;
@@ -48,7 +50,9 @@ export function describeError(error: unknown): ErrorDescription {
   if (error instanceof ProtocolError) {
     return { status: error.status, code: error.code, message: error.message, security: error.security };
   }
-  if (error instanceof ScriptFailure) return { status: error.status, code: error.code, message: error.message, details: error.details };
+  if (error instanceof ScriptFailure) {
+    return { status: error.status, code: error.code, message: error.message, details: error.details, errorFields: error.errorFields };
+  }
   if (error instanceof FetchError) return { status: 502, code: error.code, message: error.message };
   if (error instanceof StorageError) return { status: error.status, code: error.code, message: error.message };
   if (error instanceof RunCancelled) return { status: 499, code: "REQUEST_CANCELLED", message: error.message };

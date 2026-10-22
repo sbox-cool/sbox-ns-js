@@ -168,6 +168,18 @@ export function recordStepFinding(step: object, message: string): void {
   if (!stepFindings.has(step)) stepFindings.set(step, message);
 }
 
+const STEP_ERROR_DOCS_URL = "https://sboxcool.com/wiki/network-storage-v3/endpoints#error-handling";
+
+// The reference's step failure context: docsUrl plus the step's identity and the fields it names.
+function stepErrorFields(step: StepDef, errorCode?: string): Record<string, unknown> {
+  const info: Record<string, unknown> = { id: step.id, type: step.type };
+  for (const field of ["collection", "expression", "key", "table"]) {
+    if (step[field] !== undefined) info[field] = step[field];
+  }
+  if (errorCode !== undefined) info["errorCode"] = errorCode;
+  return { docsUrl: STEP_ERROR_DOCS_URL, step: info };
+}
+
 function scopeOf(state: RunState): EvalOptions {
   return { now: () => state.ns.now() };
 }
@@ -248,12 +260,14 @@ function applyRoute(step: StepDef, outcome: "true" | "false", state: RunState): 
       state.returned = true;
       return null;
     case "reject":
-      throw new ScriptFailure(route.error ?? "CONDITION_FAILED", renderMessage(route.message, state, "Condition check failed."), route.status ?? 400, {
-        conditionRejection: true,
-        flagged: route.flag === true,
-        severity: route.severity ?? null,
-        fireWebhook: route.webhook === true,
-      });
+      // A condition reject is an intentional answer, not a step failure: its error carries no docs link or step.
+      throw new ScriptFailure(
+        route.error ?? "CONDITION_FAILED",
+        renderMessage(route.message, state, "Condition check failed."),
+        route.status ?? 400,
+        { conditionRejection: true, flagged: route.flag === true, severity: route.severity ?? null, fireWebhook: route.webhook === true },
+        {},
+      );
     case "goto":
       return { kind: "goto", target: route.target };
     case "skip":
@@ -546,7 +560,7 @@ function runStep(step: StepDef, state: RunState): Flow | null {
         const outcome = applyWriteOps(existing, ops.map((op) => render(op, state)));
         state.ns.records.put(collection, key, outcome.data);
       } catch (error) {
-        if (error instanceof OperationError) state.ns.fail("INVALID_OPERATION", `Write "${step.id}": ${error.message}`, 400);
+        if (error instanceof OperationError) state.ns.fail(stepErrorCode(step), `Write "${step.id}": ${error.message}`, 400);
         throw error;
       }
       return null;
@@ -618,10 +632,13 @@ function runStep(step: StepDef, state: RunState): Flow | null {
       const found = rows.find((row) => matchesWhere(where as Record<string, unknown>, row, state)) ?? null;
       if (found === null && step["required"] === true) {
         const onMissing = isObject(step["onMissing"]) ? step["onMissing"] : {};
-        state.ns.fail(
-          typeof onMissing["errorCode"] === "string" ? onMissing["errorCode"] : "NOT_FOUND",
+        const code = typeof onMissing["errorCode"] === "string" ? onMissing["errorCode"] : "NOT_FOUND";
+        throw new ScriptFailure(
+          code,
           renderMessage(onMissing["message"], state, "Not found."),
           typeof onMissing["status"] === "number" ? onMissing["status"] : 400,
+          {},
+          stepErrorFields(step, code),
         );
       }
       scope[step.id] = found;
@@ -683,7 +700,8 @@ function runStep(step: StepDef, state: RunState): Flow | null {
   }
 }
 
-// Runs one step, converting an expression failure into a step failure as the reference does.
+// Runs one step. An expression failure becomes a step failure as the reference does, and every step failure carries
+// the reference's docsUrl and step context (a failure from a nested step already has them).
 function runStepGuarded(step: StepDef, state: RunState): Flow | null {
   const finding = stepFindings.get(step);
   if (finding !== undefined) state.ns.fail(stepErrorCode(step), finding, 400);
@@ -691,7 +709,16 @@ function runStepGuarded(step: StepDef, state: RunState): Flow | null {
     return runStep(step, state);
   } catch (error) {
     if (error instanceof ExpressionError) {
-      state.ns.fail(stepErrorCode(step), `${step.type} step "${step.id}" failed: ${error.message}`, 400);
+      throw new ScriptFailure(
+        stepErrorCode(step),
+        `${step.type} step "${step.id}" failed: ${error.message}`,
+        400,
+        {},
+        stepErrorFields(step),
+      );
+    }
+    if (error instanceof ScriptFailure && error.errorFields === undefined) {
+      throw new ScriptFailure(error.code, error.message, error.status, error.details, stepErrorFields(step));
     }
     throw error;
   }
