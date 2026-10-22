@@ -1,26 +1,24 @@
 # Parity status: SDK backend against the .NET reference
 
-Generated from the final corpus runs of the SDK backend against the .NET reference build.
+Generated from the corpus runs of the SDK backend against the .NET reference build.
 
-- Reference: `/tmp/ns-fix186`, commit `ae367a3`, built Release.
-- SDK: `packages/sdk` backend, commit `81c0dd4`, Node v26.0.0.
-- Allow-list: the reference list `tests/parity/intentional-differences.json` (untouched) merged with `packages/sdk/test/parity/sdk-intentional-differences.json` by `scripts/parity.sh` before `diff`.
+- Reference: sbox-network-storage-server `ae367a3` (tree identical to `main` at `8893c36`), built Release, .NET SDK 10.0.401.
+- SDK: `packages/sdk` backend at commit `022f876`, Node v26.0.0.
+- Allow-list: only `packages/sdk/test/parity/sdk-intentional-differences.json`. The reference list `tests/parity/intentional-differences.json` exists for managed-service-versus-.NET comparisons. It is not applied here, so every difference from the .NET reference is either fixed or listed below with a reason.
 
 ## Command
 
 ```sh
-export PATH=/Users/tom/.dotnet:$PATH DOTNET_ROOT=/Users/tom/.dotnet; hash -r
+# SQLite (exit 0)
+bash scripts/parity.sh --reference <server checkout> --ref-port 18761 --sdk-port 18762
 
-# SQLite (run output: /tmp/parity-out-sync6, ports 18799/18800, exit 0)
-bash scripts/parity.sh --reference /tmp/ns-fix186 --out /tmp/parity-out-sync6 --ref-port 18799 --sdk-port 18800
-
-# PostgreSQL 18 (run output: /tmp/parity-out-pg2, ports 18803/18804, exit 0)
-bash scripts/parity.sh --reference /tmp/ns-fix186 --storage postgres \
+# PostgreSQL 18.6 (exit 0)
+bash scripts/parity.sh --reference <server checkout> --storage postgres \
   --postgres-admin postgres://postgres@127.0.0.1:55432/postgres \
-  --pg-driver /tmp/pgdrv/node_modules/pg --out /tmp/parity-out-pg2 --ref-port 18803 --sdk-port 18804
+  --pg-driver <dir>/node_modules/pg --ref-port 18763 --sdk-port 18764
 ```
 
-`--pg-driver` takes the path of the `pg` package itself. The driver is installed in a temp directory, not an SDK dependency.
+`--pg-driver` takes the path of the `pg` package itself. The driver is installed in a temp directory, not as an SDK dependency. The reference checkout needs a Release build (`--build` builds it).
 
 ## Totals
 
@@ -28,8 +26,8 @@ Both storages produce the same result.
 
 - Scenarios: 29
 - Steps compared: 163
-- Identical: 148
-- Intentional only (matched by the allow-list): 15
+- Identical: 161
+- Differ only on SDK allow-listed paths: 2
 - Remaining unlisted differences: 0
 - Exit status: 0 on both storages
 
@@ -37,39 +35,32 @@ Both storages produce the same result.
 
 | Family | Steps | Identical | Intentional | Remaining |
 | --- | ---: | ---: | ---: | ---: |
-| 01-management-push | 46 | 35 | 11 | 0 |
+| 01-management-push | 46 | 45 | 1 | 0 |
 | 02-runtime-config | 9 | 9 | 0 | 0 |
-| 03-endpoints | 23 | 22 | 1 | 0 |
+| 03-endpoints | 23 | 23 | 0 | 0 |
 | 04-documents | 15 | 15 | 0 | 0 |
 | 05-global-records | 10 | 10 | 0 | 0 |
-| 06-ledger-and-records | 11 | 10 | 1 | 0 |
+| 06-ledger-and-records | 11 | 11 | 0 | 0 |
 | 07-analytics-and-stats | 7 | 7 | 0 | 0 |
 | 08-auth-sessions | 7 | 7 | 0 | 0 |
 | 09-queries | 6 | 6 | 0 | 0 |
-| 10-errors | 29 | 27 | 2 | 0 |
+| 10-errors | 29 | 28 | 1 | 0 |
 
 ## SDK allow-list entries
 
-Only genuinely unmatchable items belong here. Without these two entries, the diff reports two unlisted steps.
+Only items that cannot be matched belong here. Without these two entries the diff reports exactly these two steps and nothing else.
 
 | Scenario / step | Path | Reason |
 | --- | --- | --- |
-| `manage-push-all` / `preflight-invalid` | `body:$.endpoints.results[0].diagnostics[0].message` | The reference reports the .NET YamlDotNet parser's message for malformed YAML. The SDK reports its own YAML parser's message. Both are the same diagnostic: the code `COLLECTION_NAME_REQUIRED` and the failure status match. The parser wording belongs to the implementation. |
-| `errors-invalid-input` / `deploy-canary` | `body:$.owner` | The owner field identifies the implementation serving the probe. The reference answers `.NET native`; the SDK answers `@sbox-ns/sdk`. The probe's `ok` and `probe` fields match. |
+| `manage-push-all` / `preflight-invalid` | `body:$.endpoints.results[0].diagnostics[0].message` | For malformed YAML the reference reports the message from the .NET YamlDotNet parser, and the SDK reports its own YAML parser's message. The diagnostic code and the failure status match. Only the parser wording differs, and it comes from the implementation. |
+| `errors-invalid-input` / `deploy-canary` | `body:$.owner` | The owner field names the implementation that serves the probe: `.NET native` for the reference, `@sbox-ns/sdk` for the SDK. The probe's `ok` and `probe` fields match. |
 
-## Intentional steps
+## Known differences outside the corpus
 
-The 12 intentional steps differ from the reference, and the allow-lists accept those differences. Ten are covered by the reference allow-list. Two are covered by the SDK allow-list above (`preflight-invalid`, `deploy-canary`). The table is from before the latest changes; regenerate it from a fresh run.
+The corpus does not measure these. They are listed so they are not mistaken for parity.
 
-| Family | Scenario / step | Covered by | Differing paths (stable vs candidate) |
-| --- | --- | --- | --- |
-| 01 | manage-resource-crud / patch-endpoint, patch-collection, patch-workflow | reference | Reference adds `body:$.skipped: true`; SDK omits it. |
-| 01 | manage-rate-limit-rules / get | reference | Reference rules carry `id`, `enabled`, `maxPerMinute`, `maxPerHour`, `maxPerDay`. SDK rules carry `name`, `limit`, `window`. |
-| 01 | manage-queries / list, list-after-delete | reference | Reference reports `config` and `sources` per query. SDK reports flat `field`, `limit`, `order`, `ttlSeconds`, `collectionId`. |
-| 01 | manage-package-and-revision / revision-init, revision-init-outdated | reference | Reference reports `latestRevisionId`, `playerRevision`, `revisionOutdated`, `message`. SDK reports `revisionId`, `projectId`, `outdated`. |
-| 01 | manage-tests-and-tools / put-tests | reference | Reference reports `action`, `resourceKind`, `source`, `total`. SDK reports `count`. |
-| 01 | manage-push-all / preflight-invalid | SDK | YAML parser wording (see above). |
-| 03 | endpoints-player-flow / buy-drill-unaffordable | reference | A failing condition step: the SDK adds `error.docsUrl` and `error.step`, and omits `conditionRejection`, `flagged`, `severity`, `fireWebhook`. |
-| 10 | errors-invalid-input / deploy-canary | SDK | Owner identity (see above). |
-
-Several reference-covered differences are behavioral, not cosmetic (for example the buy-drill condition rejection shape). They stay here because the reference allow-list covers them. Main should review them if the goal tightens beyond the allow-list.
+- The player marker behind ledger reads (`_profiles`) is written only after a successful endpoint run. The reference also records it on handled failures and from analytics, and skips global-execution calls.
+- Reference sync stores definitions that have validator findings and fails them at run time. For step-level findings (ids, types, routes, goto targets, condition checks) the SDK does the same and answers `ENDPOINT_ERROR.CONDITION` when the step runs. Other definition-level findings are still rejected at sync.
+- Queries: `config.fields`/`columns` output shaping, count `condition`/`conditionValue`, cached reads (`?cache=1`), and the source `name` taken from the collection display name are not implemented.
+- Generic step failures sent to non-library callers include `ok:false`, which the reference omits.
+- Auto-test (`POST /v3/manage/{project}/auto-test`) runs each endpoint as a preview and discards its writes. When one auto-test covers several endpoints, a later endpoint therefore does not see an earlier endpoint's preview writes, as it would with the reference's in-memory run cache.
