@@ -11,12 +11,14 @@ import {
   patchedRecord,
   promoteStaged,
   stagedRecordOf,
+  rateLimitRuleView,
   storedRecordOf,
   upsertGameValues,
   writeCompiled,
   type Compiled,
   type EndpointEntry,
   type RecordCheck,
+  type StoredQuery,
   type ResourceKind,
 } from "./catalog.js";
 import type { RuntimeView, ServerContext } from "./context.js";
@@ -25,7 +27,7 @@ import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
 import { managementSettingsView } from "./management-settings.js";
 import { describeError, describedErrorBody, pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
 import { decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
-import { parseQuery, type QueryDefinition } from "./query-routes.js";
+import { parseQuery } from "./query-routes.js";
 import { SYNC_JOB_MESSAGE_ACCEPTED, startEndpointSync, writeEndpointBatch } from "./sync-jobs.js";
 import { upgradeSource } from "./source-upgrade.js";
 
@@ -289,7 +291,7 @@ export async function handleManage(
   if (head === "tests" && rest.length === 1 && method === "PUT") return putTests(ctx, request);
   if (head === "rate-limit-rules" && rest.length === 1 && method === "GET") {
     return jsonResponse(
-      { ok: true, projectId: ctx.options.projectId, source: "configuration", endpointRateLimits: null, rules: ctx.catalog.rateLimitRules },
+      { ok: true, projectId: ctx.options.projectId, source: "configuration", endpointRateLimits: null, rules: ctx.catalog.rateLimitRules.map(rateLimitRuleView) },
       200,
     );
   }
@@ -468,8 +470,10 @@ async function kindRoute(
           ? "unchanged"
           : "updated";
     if (action !== "unchanged") writeCompiled(ctx.catalog, [item], staged);
+    // An unchanged patch is answered as skipped, as the reference does.
+    const skipped = action === "unchanged" ? { skipped: true } : {};
     return jsonResponse(
-      withPublishTarget({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action }, decision),
+      withPublishTarget({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action, ...skipped }, decision),
       200,
     );
   }
@@ -483,10 +487,10 @@ async function kindRoute(
   throw noRoute();
 }
 
-function parseQueries(value: unknown): QueryDefinition[] {
+function parseQueries(value: unknown): StoredQuery[] {
   return arrayOf(value, "query").map((item) => {
     try {
-      return parseQuery(item);
+      return { document: item, definition: parseQuery(item) };
     } catch (error) {
       throw new ProtocolError(400, "VALIDATION_FAILED", error instanceof Error ? error.message : "Invalid query.");
     }
@@ -496,11 +500,11 @@ function parseQueries(value: unknown): QueryDefinition[] {
 async function queriesRoute(ctx: ServerContext, request: Request, rest: readonly string[]): Promise<Response> {
   const method = request.method;
   if (rest.length === 1 && method === "GET") {
-    return jsonResponse({ ok: true, data: [...ctx.catalog.queries.values()] }, 200);
+    return jsonResponse({ ok: true, data: [...ctx.catalog.queries.values()].map((stored) => stored.document) }, 200);
   }
   if (rest.length === 1 && method === "POST") {
     const queries = parseQueries(await readJsonValue(request));
-    for (const query of queries) ctx.catalog.queries.set(query.id, query);
+    for (const stored of queries) ctx.catalog.queries.set(stored.definition.id, stored);
     return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "upsert" }, 200);
   }
   const id = rest[1];
@@ -527,15 +531,18 @@ async function putRateLimits(ctx: ServerContext, request: Request): Promise<Resp
 }
 
 async function putTests(ctx: ServerContext, request: Request): Promise<Response> {
+  const root = await readJsonValue(request);
+  // The documented shape wraps the array ({tests: [...]}); the store keeps the bare array.
+  const list = isRecord(root) && "tests" in root ? root["tests"] : root;
   const tests: Record<string, unknown>[] = [];
-  for (const item of arrayOf(await readJsonValue(request), "test")) {
+  for (const item of arrayOf(list, "test")) {
     if (!isRecord(item) || typeof item["id"] !== "string" || typeof item["endpoint"] !== "string") {
       throw new ProtocolError(400, "VALIDATION_FAILED", "Each test needs an id and an endpoint.");
     }
     tests.push(item);
   }
   ctx.catalog.tests = tests;
-  return jsonResponse({ ok: true, count: tests.length }, 200);
+  return jsonResponse({ ok: true, source: "candidate", resourceKind: "tests", action: "replace", total: tests.length }, 200);
 }
 
 // The reference runs each endpoint in process as a synthetic player and reports what happened. The auto-test
@@ -711,26 +718,32 @@ async function packageSync(ctx: ServerContext, request: Request): Promise<Respon
   );
 }
 
+// The reference reads revision numbers as 64-bit integers; anything else is absent.
+function integerOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
 async function revisionInit(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   if (authorize(ctx, request, url) === null) {
     throw new KeyRefusal();
   }
   const header = request.headers.get("x-ns-revision-id");
   const body = await readJsonBody(request);
-  const claimed: unknown = header !== null && header !== "" ? Number(header) : body["revisionId"];
-  if (typeof claimed !== "number" || !Number.isInteger(claimed)) {
-    throw new ProtocolError(400, "VALIDATION_FAILED", "A revision id is required.");
-  }
-  const current = ctx.catalog.gamePackage?.["currentRevisionId"];
-  const currentRevisionId = typeof current === "number" ? current : null;
-  return jsonResponse(
-    {
-      ok: true,
-      projectId: ctx.options.projectId,
-      revisionId: claimed,
-      currentRevisionId,
-      outdated: currentRevisionId !== null && claimed < currentRevisionId,
-    },
-    200,
-  );
+  // The client's revision is the body's revisionId, else the x-ns-revision-id header. Absent is not an error.
+  const client = integerOrNull(body["revisionId"]) ?? integerOrNull(header === null || header === "" ? undefined : Number(header));
+  const pkg = ctx.catalog.gamePackage;
+  const current = integerOrNull(pkg?.["currentRevisionId"]);
+  const latest = integerOrNull(pkg?.["latestRevisionId"]) ?? current;
+  const outdated = client !== null && current !== null && client < current;
+  const message =
+    client === null
+      ? "Client revision unknown; reporting the server's latest revision."
+      : current === null
+        ? "No synced game package; nothing to compare against."
+        : outdated
+          ? `Revision ${client} is outdated. Latest is ${current}.`
+          : "Revision is current.";
+  // Null fields are left out of the response, as the reference serializer does.
+  const fields = { ok: true, playerRevision: client, currentRevisionId: current, latestRevisionId: latest, revisionOutdated: outdated, message };
+  return jsonResponse(Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== null)), 200);
 }

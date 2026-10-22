@@ -53,12 +53,19 @@ export interface WorkflowEntry {
   readonly compiled: CompiledWorkflow;
 }
 
+// A query as the editor sent it (returned verbatim by the reference) and as the runtime executes it.
+export interface StoredQuery {
+  readonly document: unknown;
+  readonly definition: QueryDefinition;
+}
+
 export interface Catalog {
   revision: number;
   readonly endpoints: Map<string, EndpointEntry>;
   readonly collections: Map<string, CollectionEntry>;
   readonly workflows: Map<string, WorkflowEntry>;
-  readonly queries: Map<string, QueryDefinition>;
+  readonly queries: Map<string, StoredQuery>;
+
   // Game values as the editor sent them, keyed by item id.
   readonly gameValues: Map<string, Record<string, unknown>>;
   // Constant groups from collections, keyed by group id. Each records its collection, so a commit or delete replaces it.
@@ -107,6 +114,36 @@ type Parser = ((text: string) => unknown) | undefined;
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : "The definition is invalid.";
+}
+
+// The rules as the reference reads them back: its RateLimitRule mapping of the stored rule-limit document. A window
+// comes from a windows object or a flat maxPerX key, as a 32-bit integer; anything else reads as null.
+export function rateLimitRuleView(rule: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const int32 = (value: unknown): value is number =>
+    typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
+  const nested = rule["windows"];
+  const windows: Readonly<Record<string, unknown>> = isRecord(nested) ? nested : {};
+  const window = (key: string, flat: string): number | null => {
+    const fromWindows: unknown = windows[key];
+    if (int32(fromWindows)) return fromWindows;
+    const direct: unknown = rule[flat];
+    return int32(direct) ? direct : null;
+  };
+  const text = (key: string, fallback: string): string => {
+    const value = rule[key];
+    return typeof value === "string" && value !== "" ? value : fallback;
+  };
+  return {
+    id: text("id", ""),
+    collection: text("collection", ""),
+    field: text("field", ""),
+    action: text("action", "reject"),
+    maxPerMinute: window("perMinute", "maxPerMinute"),
+    maxPerHour: window("perHour", "maxPerHour"),
+    maxPerDay: window("perDay", "maxPerDay"),
+    enabled: rule["enabled"] !== false,
+    scope: text("scope", "per_player"),
+  };
 }
 
 function withoutKeys(record: Readonly<Record<string, unknown>>, keys: ReadonlySet<string>): Record<string, unknown> {
@@ -543,6 +580,9 @@ export function patchedRecord(stored: Readonly<Record<string, unknown>> | undefi
   return { ...withoutKeys(stored, SOURCE_AUTHORING_FIELDS), ...incoming };
 }
 
+// Internal collection of player-known markers, keyed by steamId. Written by endpoint calls (server/endpoints.ts).
+export const PROFILES_COLLECTION = "_profiles";
+
 const INTERNAL_COLLECTIONS: readonly CollectionDefinition[] = [
   // Per-player heartbeat totals written by the stats route.
   { id: "_stats", collectionType: "per-steamid", accessMode: "endpoint", schema: { type: "object" } },
@@ -550,6 +590,8 @@ const INTERNAL_COLLECTIONS: readonly CollectionDefinition[] = [
   { id: "_analytics", collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
   // Ledger rows for _ledger number fields. Only endpoint writes create them (endpoint/ledger.ts).
   { id: LEDGER_COLLECTION, collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
+  // One record per steamId that has called an endpoint. Survives record deletes, so ledger reads still know the player.
+  { id: PROFILES_COLLECTION, collectionType: "global", accessMode: "endpoint", schema: { type: "object" } },
 ];
 
 export function storageDefinitionOf(catalog: Catalog, values: ValuesDocument): StorageDefinition {

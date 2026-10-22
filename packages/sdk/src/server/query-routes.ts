@@ -78,10 +78,11 @@ export async function handleQuery(
 ): Promise<Response> {
   const access = authorize(ctx, request, url);
   if (access === null) throw new KeyRefusal();
-  const query = ctx.catalog.queries.get(queryId);
-  if (query === undefined) {
+  const stored = ctx.catalog.queries.get(queryId);
+  if (stored === undefined) {
     return jsonResponse({ error: { code: "NOT_FOUND", message: "Query not found." } }, 404);
   }
+  const query = stored.definition;
   if (query.requiresSecretKey && !access.hasSecretKey) {
     return jsonResponse(
       {
