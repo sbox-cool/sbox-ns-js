@@ -381,7 +381,15 @@ async function gameValuesRoute(ctx: ServerContext, request: Request): Promise<Re
 }
 
 async function preflight(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
-  const body = await readJsonBody(request);
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    if (error instanceof ProtocolError && error.code === "INVALID_JSON") {
+      return jsonResponse({ ok: false, mode: "preflight", error: "INVALID_JSON", message: "Body must be valid JSON." }, 400);
+    }
+    throw error;
+  }
   const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
   return sectionsResponse(ctx, sections, "preflight", targetsNext(request, url) ? "staged" : "live");
 }
