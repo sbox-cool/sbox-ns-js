@@ -29,9 +29,12 @@ export interface CompiledWorkflow {
   definition: WorkflowFunction;
 }
 
-const ENDPOINT_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "exposure", "method", "requiresSecretKey", "input", "steps", "response"];
+const ENDPOINT_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "exposure", "internal", "internalOnly", "method", "requiresSecretKey", "input", "steps", "response"];
 const WORKFLOW_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "definition"];
-const COLLECTION_FIELDS = ["sourceVersion", "kind", "id", "name", "description", "definition"];
+// The collection envelope. Every other top-level key is the body, which is the server's shape (see compileCollection).
+const COLLECTION_ENVELOPE = ["sourceVersion", "kind", "id", "name", "description", "definition"];
+// Collection keys the server accepts that this SDK does not implement. They fail the compile rather than being dropped.
+const COLLECTION_UNSUPPORTED = ["fields", "tables", "webhookOnRateLimit"];
 const ACCESS_MODES = ["public", "endpoint", "private"];
 const INPUT_TYPES = ["string", "number", "integer", "boolean", "object", "array"];
 
@@ -161,10 +164,13 @@ export function compileEndpoint(source: unknown): CompiledEndpoint {
   const id = requireId(doc["id"], "endpoint.id");
   const method = doc["method"];
   if (method !== "GET" && method !== "POST") throw new DefinitionError("endpoint.method", "must be GET or POST.");
-  const exposure = doc["exposure"];
-  if (typeof exposure !== "string" || !ACCESS_MODES.includes(exposure)) {
-    throw new DefinitionError("endpoint.exposure", `must be one of ${ACCESS_MODES.join(", ")}.`);
+  // The server's rule: exposure is optional and defaults to public. The legacy internal and internalOnly flags also make an endpoint internal.
+  const declaredExposure: unknown = doc["exposure"] ?? "public";
+  if (declaredExposure !== "public" && declaredExposure !== "internal") {
+    throw new DefinitionError("endpoint.exposure", "must be public or internal.");
   }
+  const legacyInternal = doc["internal"] === true || doc["internalOnly"] === true;
+  const exposure = declaredExposure === "internal" || legacyInternal ? "internal" : "public";
   const requiresSecretKey = doc["requiresSecretKey"] === true;
   validateInputSchema(doc["input"], "endpoint.input");
   validateSteps(doc["steps"] ?? [], "endpoint.steps", new Set(), []);
@@ -225,6 +231,14 @@ export interface CompiledCollection {
   definition: CollectionDefinition;
   // Stripped modifiers, keyed by schema path (e.g. "schema.properties.gold"), e.g. ["_ledger"].
   modifiers: Map<string, string[]>;
+  // Game-value groups from the collection's constants, carrying the collection's visibility.
+  constants: CollectionConstants[];
+}
+
+export interface CollectionConstants {
+  id: string;
+  visibility: string;
+  entries: Record<string, unknown>;
 }
 
 function addModifier(modifiers: Map<string, string[]>, path: string, key: string): void {
@@ -262,17 +276,41 @@ function cleanSchema(schema: unknown, modifiers: Map<string, string[]>): unknown
   return standard ? cleanSchemaNode(schema, "schema", modifiers) : cleanFieldMap(schema, "schema", modifiers);
 }
 
+// Two forms, as the server reads them: a list of groups, each carrying its id and entries (the editor's shape), or a map
+// from group id to entries.
+function constantGroupsOf(value: unknown, visibility: string): CollectionConstants[] {
+  if (value === undefined) return [];
+  if (Array.isArray(value)) {
+    return value.map((group: unknown) => {
+      const record = requireObject(group, "collection.constants");
+      const id = requireId(record["id"], "collection.constants.id");
+      return { id, visibility, entries: requireObject(record["entries"], `collection.constants.${id}.entries`) };
+    });
+  }
+  const groups = requireObject(value, "collection.constants");
+  return Object.entries(groups).map(([id, entries]) => ({ id, visibility, entries: requireObject(entries, `collection.constants.${id}`) }));
+}
+
 export function compileCollection(source: unknown): CompiledCollection {
   const doc = requireObject(source, "collection");
-  rejectUnknown(doc, COLLECTION_FIELDS, "collection");
   checkSourceVersion(doc, "collection", "collection");
   const id = requireId(doc["id"], "collection.id");
-  const body = requireObject(doc["definition"], "collection.definition");
-  rejectUnknown(body, ["collectionType", "accessMode", "maxRecords", "allowRecordDelete", "requireSaveVersion", "rateLimitAction", "rateLimits", "schema"], "collection.definition");
+  // The server's shape keeps the body beside the envelope. The wrapped `definition` form is still accepted.
+  // Unknown keys are ignored, as the server ignores them. Keys the server accepts but this SDK does not implement fail.
+  const body =
+    doc["definition"] === undefined
+      ? Object.fromEntries(Object.entries(doc).filter(([key]) => !COLLECTION_ENVELOPE.includes(key)))
+      : requireObject(doc["definition"], "collection.definition");
+  for (const key of COLLECTION_UNSUPPORTED) {
+    if (Object.hasOwn(body, key)) throw new DefinitionError(`collection.${key}`, "is not supported by this SDK.");
+  }
   const accessMode = body["accessMode"];
   if (accessMode !== undefined && (typeof accessMode !== "string" || !ACCESS_MODES.includes(accessMode))) {
-    throw new DefinitionError("collection.definition.accessMode", `must be one of ${ACCESS_MODES.join(", ")}.`);
+    throw new DefinitionError("collection.accessMode", `must be one of ${ACCESS_MODES.join(", ")}.`);
   }
+  // The server's default: public when accessMode is public, otherwise private.
+  const visibility = body["visibility"] ?? (accessMode === "public" ? "public" : "private");
+  if (typeof visibility !== "string") throw new DefinitionError("collection.visibility", "must be a string.");
   const modifiers = new Map<string, string[]>();
   const definition: CollectionDefinition = {
     id,
@@ -284,5 +322,5 @@ export function compileCollection(source: unknown): CompiledCollection {
     requireSaveVersion: typeof body["requireSaveVersion"] === "boolean" ? body["requireSaveVersion"] : undefined,
     schema: cleanSchema(body["schema"], modifiers),
   };
-  return { definition, modifiers };
+  return { definition, modifiers, constants: constantGroupsOf(body["constants"], visibility) };
 }

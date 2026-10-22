@@ -37,7 +37,8 @@ function resolveEndpoint(
     return { handler: ctx.options.endpoints[slug]!, requiresSecretKey: false, execution: "scripted" };
   }
   const entry = catalog.endpoints.get(slug);
-  if (entry === undefined || !entry.enabled) return null;
+  // Internal endpoints are not served over HTTP. The reference answers them as not found.
+  if (entry === undefined || !entry.enabled || entry.compiled.exposure === "internal") return null;
   return {
     handler: entry.compiled.handler,
     requiresSecretKey: entry.compiled.requiresSecretKey,

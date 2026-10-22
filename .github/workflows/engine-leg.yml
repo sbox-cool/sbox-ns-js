@@ -9,6 +9,8 @@ on:
     paths:
       - ".github/workflows/engine-leg.yml"
       - "scripts/ci/engine-leg.ps1"
+      - "packages/sdk/**"
+      - "packages/create-sbox-ns-backend/**"
   workflow_dispatch:
     inputs:
       libraries:

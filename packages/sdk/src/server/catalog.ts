@@ -4,6 +4,7 @@ import {
   compileWorkflow,
   DefinitionError,
   type CompiledCollection,
+  type CollectionConstants,
   type CompiledEndpoint,
   type CompiledWorkflow,
 } from "../dsl/compile.js";
@@ -59,6 +60,8 @@ export interface Catalog {
   readonly queries: Map<string, QueryDefinition>;
   // Game values as the editor sent them, keyed by item id.
   readonly gameValues: Map<string, Record<string, unknown>>;
+  // Constant groups from collections, keyed by group id. Each records its collection, so a commit or delete replaces it.
+  readonly constantGroups: Map<string, { readonly collection: string; readonly visibility: string; readonly entries: Record<string, unknown> }>;
   rateLimitRules: Record<string, unknown>[];
   tests: Record<string, unknown>[];
   gamePackage: Record<string, unknown> | null;
@@ -74,6 +77,7 @@ export function createCatalog(): Catalog {
     workflows: new Map(),
     queries: new Map(),
     gameValues: new Map(),
+    constantGroups: new Map(),
     rateLimitRules: [],
     tests: [],
     gamePackage: null,
@@ -241,8 +245,10 @@ export function definitionFault(kind: ResourceKind, record: Readonly<Record<stri
 export function commitCompiled(catalog: Catalog, items: readonly Compiled[]): void {
   for (const item of items) {
     if (item.kind === "endpoints") catalog.endpoints.set(item.id, item.entry);
-    else if (item.kind === "collections") catalog.collections.set(item.id, item.entry);
-    else catalog.workflows.set(item.id, item.entry);
+    else if (item.kind === "collections") {
+      catalog.collections.set(item.id, item.entry);
+      replaceConstantGroups(catalog, item.id, item.entry.compiled.constants);
+    } else catalog.workflows.set(item.id, item.entry);
   }
   catalog.revision += 1;
 }
@@ -361,8 +367,19 @@ export function deleteResource(catalog: Catalog, kind: ResourceKind, id: string)
       : kind === "collections"
         ? catalog.collections.delete(id)
         : catalog.workflows.delete(id);
+  if (removed && kind === "collections") replaceConstantGroups(catalog, id, []);
   if (removed) catalog.revision += 1;
   return removed;
+}
+
+// A collection's constant groups are replaced whole on every commit or delete, so a removed group does not linger.
+function replaceConstantGroups(catalog: Catalog, collection: string, groups: readonly CollectionConstants[]): void {
+  for (const [id, group] of catalog.constantGroups) {
+    if (group.collection === collection) catalog.constantGroups.delete(id);
+  }
+  for (const group of groups) {
+    catalog.constantGroups.set(group.id, { collection, visibility: group.visibility, entries: group.entries });
+  }
 }
 
 // Game values: groups hold entries, tables hold rows. Editor items win over the static values in ServerOptions.
@@ -376,7 +393,15 @@ export function valuesOf(catalog: Catalog, base: ValuesDocument | undefined): Va
       groups[id] = { name: item["name"], description: item["description"], values: item["entries"] };
     }
   }
+  for (const [id, group] of catalog.constantGroups) groups[id] = { name: id, values: group.entries };
   return { groups, tables };
+}
+
+// Client-facing values: constant groups from private collections are left out, as the reference's client format does.
+export function publicValuesOf(catalog: Catalog, base: ValuesDocument | undefined): ValuesDocument {
+  const values = valuesOf(catalog, base);
+  const groups = Object.fromEntries(Object.entries(values.groups).filter(([id]) => catalog.constantGroups.get(id)?.visibility !== "private"));
+  return { groups, tables: values.tables };
 }
 
 // Upserts editor game values by id; the revision bump makes storage rebuild with the new values.
@@ -416,7 +441,8 @@ const INTERNAL_COLLECTIONS: readonly CollectionDefinition[] = [
 ];
 
 export function storageDefinitionOf(catalog: Catalog, values: ValuesDocument): StorageDefinition {
-  const user = [...catalog.collections.values()].map((entry) => entry.compiled.definition);
+  // A collection without a schema holds constants only: it has no records, so storage does not get it.
+  const user = [...catalog.collections.values()].map((entry) => entry.compiled.definition).filter((definition) => definition.schema !== undefined);
   const reserved = new Set(INTERNAL_COLLECTIONS.map((definition) => definition.id));
   return {
     collections: [...INTERNAL_COLLECTIONS, ...user.filter((definition) => !reserved.has(definition.id))],

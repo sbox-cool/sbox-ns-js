@@ -1,7 +1,7 @@
 import { jsonResponse } from "../util/http.js";
 import type { ServerContext } from "./context.js";
 import { KeyRefusal } from "./auth-failure.js";
-import { valuesOf } from "./catalog.js";
+import { publicValuesOf } from "./catalog.js";
 import { targetsNext } from "./publish-target.js";
 import { safeEqual } from "./http.js";
 
@@ -18,7 +18,7 @@ export function handleValues(ctx: ServerContext, request: Request, url: URL): Re
   if (!safeEqual(key, ctx.options.publicKey)) {
     throw new KeyRefusal();
   }
-  const values = valuesOf(ctx.view(targetsNext(request, url)).catalog, ctx.options.values);
+  const values = publicValuesOf(ctx.view(targetsNext(request, url)).catalog, ctx.options.values);
   // The reference reports no values version or update time for a project synced from the editor.
   return jsonResponse({ groups: values.groups, tables: values.tables, updatedAt: null, version: null }, 200);
 }
