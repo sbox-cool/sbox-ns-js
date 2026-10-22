@@ -2,9 +2,10 @@ import { ProtocolError } from "../protocol/errors.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse } from "../util/http.js";
 import {
-  compileBatch,
+  checkRecord,
   deleteResource,
-  documentFor,
+  KIND_LABEL,
+  storedFor,
   documentOf,
   patchedRecord,
   promoteStaged,
@@ -12,13 +13,14 @@ import {
   storedRecordOf,
   upsertGameValues,
   writeCompiled,
-  type BatchCompile,
-  type RecordResult,
+  type Compiled,
+  type RecordCheck,
   type ResourceKind,
 } from "./catalog.js";
 import type { ServerContext } from "./context.js";
 import { authorize, handleEndpoint } from "./endpoints.js";
 import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
+import { managementSettingsView } from "./management-settings.js";
 import { pathSegment, readBodyText, readJsonBody, readJsonValue, safeEqual } from "./http.js";
 import { PUBLISH_TARGET_HEADER, decidePublish, targetsNext, withPublishTarget, type PublishDecision } from "./publish-target.js";
 import { parseQuery, type QueryDefinition } from "./query-routes.js";
@@ -29,7 +31,6 @@ import { upgradeSource } from "./source-upgrade.js";
 // calls with its public key. Section writes are all-or-nothing: a batch that fails to compile changes nothing.
 
 const KINDS: readonly ResourceKind[] = ["endpoints", "collections", "workflows"];
-const KIND_LABEL: Record<ResourceKind, string> = { endpoints: "endpoint", collections: "collection", workflows: "workflow" };
 // Fields of the editor's game package record that the server keeps. Raw editor payloads are not stored.
 const GAME_PACKAGE_FIELDS = [
   "packageId",
@@ -45,17 +46,22 @@ const GAME_PACKAGE_FIELDS = [
   "publishStatus",
 ] as const;
 
-interface SectionReport {
-  ok: boolean;
-  error: string | null;
-  message: string | null;
-  results: readonly RecordResult[];
+// One record of a section: the compiled form, or the check it failed.
+interface SectionItem {
+  readonly slot: number;
+  readonly raw: unknown;
+  readonly check: RecordCheck;
 }
 
+// A section of a request. A non-array value sets shapeError; otherwise every record is checked and the section is ok
+// only when all of them passed.
 interface Section {
   readonly kind: ResourceKind;
-  readonly batch: BatchCompile | null;
-  readonly report: SectionReport;
+  readonly shapeError: string | null;
+  readonly items: readonly SectionItem[];
+  readonly compiled: readonly Compiled[];
+  readonly ok: boolean;
+  readonly message: string | null;
 }
 
 interface TestResult {
@@ -87,61 +93,121 @@ function arrayOf(value: unknown, label: string): unknown[] {
   return value;
 }
 
+// The name field a PUT record is identified by, besides its id.
+const PUT_NAME_FIELD: Readonly<Record<ResourceKind, string>> = { endpoints: "slug", collections: "name", workflows: "name" };
+
+// The checks a PUT body gets before any record compiles: an array of objects, each with its name field or an id. The
+// messages are the reference's for each failure. Null when the body passes.
+function putShapeError(kind: ResourceKind, value: unknown): string | null {
+  const label = KIND_LABEL[kind];
+  if (!Array.isArray(value)) return `Body must be an array of ${label} objects.`;
+  const field = PUT_NAME_FIELD[kind];
+  for (const item of value) {
+    if (!isRecord(item)) return `Each ${label} must be an object.`;
+    const named = [item[field], item["id"]].some((entry) => typeof entry === "string" && entry.trim() !== "");
+    if (!named) return `Each ${label} must have '${field}' or 'id'.`;
+  }
+  return null;
+}
+
 function kindOfPath(segment: string | undefined): ResourceKind | null {
   return KINDS.find((kind) => kind === segment) ?? null;
 }
 
-// Compiles one section without committing it. A non-array value fails the section, never the request.
+// One section of a request, checked record by record. A non-array value fails the section, never the request. Nothing
+// is committed unless every section passed.
 function compileSection(ctx: ServerContext, kind: ResourceKind, value: unknown): Section {
   if (!Array.isArray(value)) {
-    return {
-      kind,
-      batch: null,
-      report: {
-        ok: false,
-        error: "VALIDATION_FAILED",
-        message: `Body must be an array of ${KIND_LABEL[kind]} objects.`,
-        results: [],
-      },
-    };
+    const shapeError = `${KIND_LABEL[kind]}s must be an array`;
+    return { kind, shapeError, items: [], compiled: [], ok: false, message: shapeError };
   }
-  const batch = compileBatch(kind, value, ctx.options.parseYaml);
-  const failure = batch.results.find((result) => !result.ok);
+  const items = value.map((raw, slot) => ({ slot, raw, check: checkRecord(kind, raw, ctx.options.parseYaml) }));
+  const faults = items.flatMap((item) => (item.check.ok ? [] : [item.check.fault]));
   return {
     kind,
-    batch,
-    report: {
-      ok: batch.ok,
-      error: batch.ok ? null : "VALIDATION_FAILED",
-      message: failure?.message ?? null,
-      results: batch.results,
-    },
+    shapeError: null,
+    items,
+    compiled: items.flatMap((item) => (item.check.ok ? [item.check.item] : [])),
+    ok: faults.length === 0,
+    message: faults[0]?.message ?? null,
   };
 }
 
-// Sync and preflight answer per kind. Preflight writes nothing and reports would_create or would_update; sync
-// reports upsert per record. A failing section makes the whole request a 400.
-function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "preflight"): Record<string, unknown> {
-  const label = KIND_LABEL[section.kind];
-  if (section.batch === null) {
-    return { ok: false, error: section.report.error, message: section.report.message, results: [] };
+// The id a record is listed and reported under in preflight: the first of slug/id/sourcePath (endpoints), name/id/
+// sourcePath (collections), or id/name/sourcePath (workflows), else the kind and slot.
+function previewId(kind: ResourceKind, record: unknown, slot: number): string {
+  const field = (key: string): string | undefined => {
+    if (!isRecord(record)) return undefined;
+    const value = record[key];
+    return typeof value === "string" && value.trim() !== "" ? value : undefined;
+  };
+  const order = kind === "endpoints" ? ["slug", "id"] : kind === "collections" ? ["name", "id"] : ["id", "name"];
+  for (const key of [...order, "sourcePath"]) {
+    const value = field(key);
+    if (value !== undefined) return value;
   }
-  const results = section.report.results.map((result) => {
-    if (!result.ok) {
-      const failure: Record<string, unknown> = { ok: false, error: "VALIDATION_FAILED", resourceId: result.id, resourceKind: label };
-      if (mode === "preflight") {
-        failure["diagnostics"] = [{ code: "VALIDATION_FAILED", message: result.message, resourceId: result.id, resourceKind: label, severity: "error" }];
-      }
-      return failure;
-    }
-    if (mode === "sync") return { action: "upsert", ok: true, resourceId: result.id, resourceKind: label };
-    const action = documentOf(ctx.catalog, section.kind, result.id) === undefined ? "would_create" : "would_update";
-    return { action, ok: true, resourceId: result.id, resourceKind: label, diagnostics: [] };
-  });
-  const failed = section.report.results.filter((result) => !result.ok).length;
-  const counts = mode === "sync" ? { total: results.length } : { passed: results.length - failed, failed, total: results.length, warnings: 0 };
-  const failure = section.report.ok ? {} : { error: section.report.error, message: section.report.message };
-  return { ok: section.report.ok, ...counts, results, ...failure };
+  return `${KIND_LABEL[kind]}[${slot}]`;
+}
+
+// Collection names should be lowercase letters, numbers, or underscores. A name outside that set is a warning; the
+// push still stores it.
+function nameWarnings(kind: ResourceKind, stored: Readonly<Record<string, unknown>>, resourceId: string): Record<string, unknown>[] {
+  const name = stored["name"];
+  if (kind !== "collections" || typeof name !== "string" || name === "" || /^[a-z0-9_]+$/.test(name)) return [];
+  return [
+    {
+      severity: "warning",
+      code: "COLLECTION_NAME_FORMAT",
+      message: "Collection name should be lowercase letters, numbers, or underscores.",
+      resourceKind: KIND_LABEL[kind],
+      resourceId,
+      sourcePath: "name",
+      suggestedFix: "Use a collection name like player_data.",
+    },
+  ];
+}
+
+// One record's report. Sync answers the upsert or the fault that stopped it. Preflight answers the diagnostics a write
+// would raise, and would_create or would_update for a record that passes.
+function itemReport(
+  ctx: ServerContext,
+  kind: ResourceKind,
+  item: SectionItem,
+  mode: "sync" | "preflight",
+): { report: Record<string, unknown>; warnings: number } {
+  const label = KIND_LABEL[kind];
+  const check = item.check;
+  if (mode === "sync") {
+    if (check.ok) return { report: { ok: true, resourceKind: label, resourceId: check.item.id, action: "upsert" }, warnings: 0 };
+    const message = check.fault.stage === "identifier" ? `${label} is missing a required identifier field.` : check.fault.message;
+    const error = check.fault.stage === "source" ? "SOURCE_COMPILE_FAILED" : "VALIDATION_FAILED";
+    return { report: { ok: false, resourceKind: label, resourceId: `${label}[${item.slot}]`, error, message }, warnings: 0 };
+  }
+  if (!check.ok) {
+    const resourceId = previewId(kind, check.stored ?? item.raw, item.slot);
+    const fault = check.fault;
+    const diagnostic = { severity: "error", code: fault.code, message: fault.message, resourceKind: label, resourceId, sourcePath: fault.sourcePath, suggestedFix: fault.suggestedFix };
+    return { report: { ok: false, resourceKind: label, resourceId, error: "VALIDATION_FAILED", diagnostics: [diagnostic] }, warnings: 0 };
+  }
+  const resourceId = previewId(kind, check.stored, item.slot);
+  const diagnostics = nameWarnings(kind, check.stored, resourceId);
+  const action = documentOf(ctx.catalog, kind, check.item.id) === undefined ? "would_create" : "would_update";
+  return { report: { ok: true, resourceKind: label, resourceId, action, diagnostics }, warnings: diagnostics.length };
+}
+
+// One section's report. A non-array section fails with its message. Otherwise every record reports; a failing section
+// makes the request a 400.
+function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "preflight"): Record<string, unknown> {
+  if (section.shapeError !== null) {
+    const failure = { ok: false, error: "VALIDATION_FAILED", message: section.shapeError, results: [] };
+    return mode === "preflight" ? { ...failure, total: 0, passed: 0, failed: 1, warnings: 0 } : failure;
+  }
+  const reports = section.items.map((item) => itemReport(ctx, section.kind, item, mode));
+  const results = reports.map((entry) => entry.report);
+  if (mode === "sync") return { ok: section.ok, total: results.length, results };
+  const failed = section.items.filter((item) => !item.check.ok).length;
+  const warnings = reports.reduce((count, entry) => count + entry.warnings, 0);
+  return { ok: section.ok, total: results.length, passed: results.length - failed, failed, warnings, results };
 }
 
 // Builds the response for a set of sections. A failing section returns 400 and nothing is committed by the caller.
@@ -153,7 +219,7 @@ function sectionsResponse(
 ): Response {
   const reports: Record<string, Record<string, unknown>> = {};
   for (const section of sections) reports[section.kind] = sectionReport(ctx, section, mode);
-  const ok = sections.every((section) => section.report.ok);
+  const ok = sections.every((section) => section.ok);
   if (mode === "preflight") return preflightResponse(reports, ok, decision === "staged" ? "next" : "live");
   return jsonResponse(withPublishTarget({ ok, source: "candidate", ...reports }, decision), ok ? 200 : 400);
 }
@@ -189,23 +255,16 @@ function preflightResponse(
 // The documents a list returns. With includeStaged, the staged copies follow the live documents, marked as the next
 // revision. Workflows have no staged revision.
 function documentsOf(ctx: ServerContext, kind: ResourceKind, includeStaged: boolean): unknown[] {
-  let documents: unknown[];
-  if (kind === "endpoints") {
-    documents = [...ctx.catalog.endpoints.values()].map((entry) => ({ ...entry.document, enabled: entry.enabled }));
-  } else if (kind === "collections") {
-    documents = [...ctx.catalog.collections.values()].map((entry) => entry.document);
-  } else {
-    return [...ctx.catalog.workflows.values()].map((entry) => entry.document);
-  }
-  if (!includeStaged) return documents;
+  const live =
+    kind === "endpoints"
+      ? [...ctx.catalog.endpoints.values()].map((entry) => entry.stored)
+      : kind === "collections"
+        ? [...ctx.catalog.collections.values()].map((entry) => entry.stored)
+        : [...ctx.catalog.workflows.values()].map((entry) => entry.stored);
+  if (!includeStaged || kind === "workflows") return live;
   const staged = kind === "endpoints" ? ctx.catalog.staged.endpoints : ctx.catalog.staged.collections;
-  const copies = [...staged.values()].map((record) => {
-    const document = documentFor(kind, record, ctx.options.parseYaml);
-    return kind === "endpoints"
-      ? { ...document, enabled: record["enabled"] !== false, revisionTarget: "next" }
-      : { ...document, revisionTarget: "next" };
-  });
-  return [...documents, ...copies];
+  const copies = [...staged.values()].map((record) => ({ ...storedFor(kind, record, ctx.options.parseYaml), revisionTarget: "next" }));
+  return [...live, ...copies];
 }
 
 // Staged copies join a list only when asked for with includeStaged=true; revisionTarget=live keeps the list live.
@@ -227,28 +286,9 @@ export async function handleManage(
     return revisionInit(ctx, request, url);
   }
   requireSecret(ctx, request);
-  if (head === "validate" && rest.length === 1 && method === "GET") {
-    return jsonResponse({ ok: true, projectId: ctx.options.projectId, revision: ctx.catalog.revision }, 200);
-  }
-  if (head === "settings" && rest.length === 1 && method === "GET") {
-    return jsonResponse({ ok: true, projectId: ctx.options.projectId, settings: ctx.options.settings }, 200);
-  }
-  if (head === "config" && rest.length === 1 && method === "GET") {
-    return jsonResponse(
-      {
-        ok: true,
-        projectId: ctx.options.projectId,
-        revision: ctx.catalog.revision,
-        counts: {
-          endpoints: ctx.catalog.endpoints.size,
-          collections: ctx.catalog.collections.size,
-          workflows: ctx.catalog.workflows.size,
-          queries: ctx.catalog.queries.size,
-          gameValues: ctx.catalog.gameValues.size,
-        },
-      },
-      200,
-    );
+  if (head === "validate" && rest.length === 1 && method === "GET") return validateRoute(ctx, request);
+  if ((head === "settings" || head === "config") && rest.length === 1 && method === "GET") {
+    return jsonResponse(settingsResponse(ctx), 200);
   }
   if (head === "game-values" && rest.length === 1) return gameValuesRoute(ctx, request);
   if (head === "sync" && second === "preflight" && rest.length === 2 && method === "POST") {
@@ -282,6 +322,47 @@ export async function handleManage(
   throw noRoute();
 }
 
+// Reports the secret key (already checked) and the public key the editor sends in x-public-key. The public key must
+// be this project's public key; a secret key sent in its place is named as such.
+function validateRoute(ctx: ServerContext, request: Request): Response {
+  const presented = request.headers.get("x-public-key") ?? "";
+  let publicKey: { ok: boolean; message: string };
+  if (presented === "") {
+    publicKey = { ok: false, message: "Not provided" };
+  } else if (safeEqual(presented, ctx.options.publicKey)) {
+    publicKey = { ok: true, message: "Valid" };
+  } else if (ctx.options.secretKey !== null && safeEqual(presented, ctx.options.secretKey)) {
+    publicKey = { ok: false, message: "Not a public key" };
+  } else {
+    publicKey = { ok: false, message: "Invalid" };
+  }
+  return jsonResponse(
+    {
+      ok: true,
+      project: { id: ctx.options.projectId, title: ctx.options.projectId, settings: { enabled: true } },
+      checks: {
+        projectId: { ok: true, message: "Found" },
+        secretKey: { ok: true, message: "Valid" },
+        publicKey,
+      },
+    },
+    200,
+  );
+}
+
+// Settings and config are the same document: the settings under both keys, plus the two flags the library reads.
+function settingsResponse(ctx: ServerContext): Record<string, unknown> {
+  const settings = managementSettingsView(ctx.options);
+  return {
+    ok: true,
+    projectId: ctx.options.projectId,
+    settings,
+    config: settings,
+    enableAuthSessions: settings["enableAuthSessions"],
+    enableEncryptedRequests: settings["enableEncryptedRequests"],
+  };
+}
+
 async function gameValuesRoute(ctx: ServerContext, request: Request): Promise<Response> {
   if (request.method === "GET") {
     return jsonResponse({ ok: true, data: { items: [...ctx.catalog.gameValues.values()] } }, 200);
@@ -310,10 +391,8 @@ async function syncAll(ctx: ServerContext, request: Request, url: URL): Promise<
   const decision = decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
   const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
   // All-or-nothing across kinds: nothing is committed unless every section compiled.
-  if (sections.every((section) => section.report.ok)) {
-    for (const section of sections) {
-      if (section.batch !== null) writeCompiled(ctx.catalog, section.batch.compiled, decision === "staged");
-    }
+  if (sections.every((section) => section.ok)) {
+    for (const section of sections) writeCompiled(ctx.catalog, section.compiled, decision === "staged");
   }
   return sectionsResponse(ctx, sections, "sync", decision);
 }
@@ -358,14 +437,17 @@ async function kindRoute(
     if (kind === "endpoints" && url.searchParams.get("async") === "true") {
       return asyncEndpointSync(ctx, request, url);
     }
-    const section = compileSection(ctx, kind, await readJsonValue(request));
-    if (section.batch === null || !section.report.ok) return writeFailure(kind, section.report.message, decision);
+    const records = await readJsonValue(request);
+    const shapeError = putShapeError(kind, records);
+    if (shapeError !== null) return writeFailure(kind, shapeError, decision);
+    const section = compileSection(ctx, kind, records);
+    if (!section.ok) return writeFailure(kind, section.message, decision);
     if (kind === "endpoints") {
-      writeEndpointBatch(ctx.catalog, section.batch.compiled, staged, url.searchParams.get("replaceAll") === "true");
+      writeEndpointBatch(ctx.catalog, section.compiled, staged, url.searchParams.get("replaceAll") === "true");
     } else {
-      writeCompiled(ctx.catalog, section.batch.compiled, staged);
+      writeCompiled(ctx.catalog, section.compiled, staged);
     }
-    const results = section.batch.compiled.map((item) => ({ action: "upsert", ok: true, resourceId: item.id, resourceKind: label }));
+    const results = section.compiled.map((item) => ({ action: "upsert", ok: true, resourceId: item.id, resourceKind: label }));
     return jsonResponse(withPublishTarget({ ok: true, resourceKind: label, results, source: "candidate" }, decision), 200);
   }
   if (rest.length === 1 && method === "PATCH") {
@@ -374,23 +456,23 @@ async function kindRoute(
     const incoming = isRecord(value) && isRecord(value[label]) && value["id"] === undefined ? value[label] : value;
     if (!isRecord(incoming)) return writeFailure(kind, `Body must contain a ${label} object.`, decision);
     const first = compileSection(ctx, kind, [incoming]);
-    const [only] = first.batch?.compiled ?? [];
-    if (only === undefined || !first.report.ok) return writeFailure(kind, first.report.message, decision);
+    const [only] = first.compiled;
+    if (only === undefined || !first.ok) return writeFailure(kind, first.message, decision);
     // A staged patch merges over the staged copy when one exists, otherwise over the stored record. The existing
     // document is the one the patch applies to, so it decides between created, updated and unchanged.
     const stagedRecord = staged ? stagedRecordOf(ctx.catalog, kind, only.id) : undefined;
     const existing =
       stagedRecord === undefined
         ? documentOf(ctx.catalog, kind, only.id)
-        : documentFor(kind, stagedRecord, ctx.options.parseYaml);
+        : storedFor(kind, stagedRecord, ctx.options.parseYaml);
     const merged = patchedRecord(stagedRecord ?? storedRecordOf(ctx.catalog, kind, only.id), incoming);
     const section = compileSection(ctx, kind, [merged]);
-    const [item] = section.batch?.compiled ?? [];
-    if (item === undefined || !section.report.ok) return writeFailure(kind, section.report.message, decision);
+    const [item] = section.compiled;
+    if (item === undefined || !section.ok) return writeFailure(kind, section.message, decision);
     const action =
       existing === undefined
         ? "created"
-        : JSON.stringify(existing) === JSON.stringify(item.entry.document)
+        : JSON.stringify(existing) === JSON.stringify(item.entry.stored)
           ? "unchanged"
           : "updated";
     if (action !== "unchanged") writeCompiled(ctx.catalog, [item], staged);
