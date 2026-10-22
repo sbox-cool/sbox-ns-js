@@ -148,6 +148,15 @@ describe("compute step", () => {
   });
 });
 
+describe("condition step without an id", () => {
+  it("is stored at sync and answers ENDPOINT_ERROR.CONDITION 400 when it runs", async () => {
+    const doc = endpointDoc([{ type: "condition", field: "player", operator: "is_null", onFail: "return" }], {});
+    const failure = await failureOf(doc);
+    assert.equal(failure.code, "ENDPOINT_ERROR.CONDITION");
+    assert.equal(failure.status, 400);
+  });
+});
+
 describe("random step", () => {
   it("int mode draws from [min, max) only", async () => {
     const doc = endpointDoc([{ id: "roll", type: "random", mode: "int", min: 1, max: 4 }], { roll: "{{ roll }}" });

@@ -542,6 +542,9 @@ function runStep(step: StepDef, state: RunState): Flow | null {
       return null;
     }
     case "condition": {
+      if (step.id === undefined || step["check"] === undefined) {
+        state.ns.fail(stepErrorCode(step), "A condition needs an id and a check.", 400);
+      }
       const passed = evaluateCond(step["check"], state);
       scope[step.id] = passed;
       const onFail = step["onFail"];

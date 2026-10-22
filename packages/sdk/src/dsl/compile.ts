@@ -72,16 +72,19 @@ function validateSteps(steps: unknown, path: string, seen: Set<string>, enclosin
   const entries = steps.map((raw, index) => {
     const at = `${path}[${index}]`;
     const step = requireObject(raw, at);
-    const id = requireId(step["id"], `${at}.id`);
-    if (seen.has(id)) throw new DefinitionError(`${at}.id`, `duplicate step id "${id}".`);
-    seen.add(id);
     const type = step["type"];
     if (typeof type !== "string" || !STEP_TYPES.includes(type)) {
       throw new DefinitionError(`${at}.type`, `unsupported step type "${String(type)}".`);
     }
+    // A condition with no id is stored, not rejected: it answers ENDPOINT_ERROR.CONDITION when it runs (the hosted backend's behaviour).
+    const id = type === "condition" && step["id"] === undefined ? null : requireId(step["id"], `${at}.id`);
+    if (id !== null) {
+      if (seen.has(id)) throw new DefinitionError(`${at}.id`, `duplicate step id "${id}".`);
+      seen.add(id);
+    }
     return { at, step, id, type };
   });
-  const visible = [...enclosing, ...entries.map((entry) => entry.id)];
+  const visible = [...enclosing, ...entries.flatMap((entry) => (entry.id === null ? [] : [entry.id]))];
   for (const { at, step, type } of entries) {
     if (type === "block") validateSteps(step["steps"] ?? [], `${at}.steps`, seen, visible);
     if (step["routes"] !== undefined) validateRoutes(step["routes"], `${at}.routes`, visible);
