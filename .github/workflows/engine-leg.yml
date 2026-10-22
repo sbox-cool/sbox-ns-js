@@ -4,6 +4,11 @@ name: Engine leg
 # ci-only evidence: the dedicated server runs headless on windows-latest; no native editor run happens here.
 
 on:
+  push:
+    branches: [issue150-portable-sdk]
+    paths:
+      - ".github/workflows/engine-leg.yml"
+      - "scripts/ci/engine-leg.ps1"
   workflow_dispatch:
     inputs:
       libraries:
@@ -69,7 +74,7 @@ jobs:
       - name: Run engine leg
         shell: pwsh
         env:
-          LIBRARIES: ${{ inputs.libraries }}
+          LIBRARIES: ${{ inputs.libraries || 'main latest' }}
         run: |
           $libs = $env:LIBRARIES -split '\s+' | Where-Object { $_ -ne '' }
           ./scripts/ci/engine-leg.ps1 -Engine $env:ENGINE_GAME -ServerDir "$PWD\sbox-network-storage-server" -Out "$PWD\engine-leg-out" -Libraries $libs
