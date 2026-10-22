@@ -37,12 +37,11 @@ jobs:
       - name: Check out sbox-ns-js
         uses: actions/checkout@v4
 
-      - name: Check out sbox-network-storage-server (PR 188 harness branch)
+      - name: Check out sbox-network-storage-server (harness at main)
         uses: actions/checkout@v4
         with:
           repository: sbox-cool/sbox-network-storage-server
-          # Harness-only server PR #188 (sbox-cool/sbox-network-storage-server); revert to main once merged.
-          ref: feat/e2e-external-encryption
+          ref: main
           path: sbox-network-storage-server
 
       - name: Set up Node 22 (node:sqlite)
