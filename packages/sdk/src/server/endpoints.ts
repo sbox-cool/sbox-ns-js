@@ -153,12 +153,12 @@ async function runCall(
   state: CallState,
 ): Promise<Response> {
   const { options } = ctx;
-  const envelope = body !== null && isEncryptedBody(body) ? body : null;
+  const envelope = envelopeOf(body);
   const view = ctx.view(targetsNext(request, url));
   if (pathSlug !== null && resolveEndpoint(ctx, view.catalog, pathSlug) === null) {
     throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `Endpoint "${pathSlug}" was not found.`);
   }
-  const slug = resolveSlug(pathSlug, body, envelope !== null);
+  const slug = resolveSlug(pathSlug, envelope ?? body, envelope !== null);
   const target = resolveEndpoint(ctx, view.catalog, slug);
   if (target === null) {
     throw new ProtocolError(404, "ENDPOINT_NOT_FOUND", `Endpoint "${slug}" was not found.`);
@@ -424,6 +424,17 @@ function findRequestKey(ctx: ServerContext, keyId: string, nowMs: number): Loade
 
 function isEncryptedBody(body: Readonly<Record<string, unknown>>): boolean {
   return body.encrypted === true || "encryptedPayload" in body || "ciphertext" in body;
+}
+
+// The envelope a body carries, as the reference reads it: the nested `envelope` or `encryptedRequest` object, or the
+// body itself when the encrypted flag or ciphertext sits at the top level.
+function envelopeOf(body: Readonly<Record<string, unknown>> | null): Readonly<Record<string, unknown>> | null {
+  if (body === null) return null;
+  for (const name of ["envelope", "encryptedRequest"]) {
+    const nested = body[name];
+    if (isRecord(nested)) return nested;
+  }
+  return isEncryptedBody(body) ? body : null;
 }
 
 function nonEmpty(value: unknown): string | null {
