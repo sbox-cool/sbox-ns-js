@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it, mock } from "node:test";
-import { compileEndpoint, compileWorkflow, DefinitionError } from "../src/dsl/compile.js";
+import { compileEndpoint, compileWorkflow } from "../src/dsl/compile.js";
 import { DslResponse } from "../src/dsl/steps.js";
 import type { ExecutionMode } from "../src/endpoint/execution.js";
 import { RunCancelled, ScriptFailure, runEndpoint, type RunEnvironment } from "../src/endpoint/runtime.js";
@@ -148,12 +148,32 @@ describe("compute step", () => {
   });
 });
 
-describe("condition step without an id", () => {
-  it("is stored at sync and answers ENDPOINT_ERROR.CONDITION 400 when it runs", async () => {
+describe("step findings", () => {
+  it("stores a condition with no id or check, and answers ENDPOINT_ERROR.CONDITION 400 when it runs", async () => {
     const doc = endpointDoc([{ type: "condition", field: "player", operator: "is_null", onFail: "return" }], {});
     const failure = await failureOf(doc);
     assert.equal(failure.code, "ENDPOINT_ERROR.CONDITION");
     assert.equal(failure.status, 400);
+  });
+
+  it("stores an unsupported step type and fails when it is reached", async () => {
+    const failure = await failureOf(endpointDoc([{ id: "x", type: "teleport" }], {}));
+    assert.equal(failure.code, "ENDPOINT_ERROR.TELEPORT");
+    assert.equal(failure.status, 400);
+    assert.match(failure.message, /unsupported step type "teleport"/);
+  });
+
+  it("stores a duplicate step id and fails at the second step, not the first", async () => {
+    const doc = endpointDoc(
+      [
+        { id: "calc", type: "compute", values: { a: "1" } },
+        { id: "calc", type: "compute", values: { b: "2" } },
+      ],
+      {},
+    );
+    const failure = await failureOf(doc);
+    assert.equal(failure.code, "ENDPOINT_ERROR.COMPUTE");
+    assert.match(failure.message, /duplicate step id "calc"/);
   });
 });
 
@@ -232,12 +252,14 @@ describe("goto, skip and visit limits", () => {
     assert.match(failure.message, /exceeded visit limit/);
   });
 
-  it("rejects a goto to a step that is not in scope at compile time", () => {
+  it("stores a goto to a step that is not in scope and fails when the step runs", async () => {
     const doc = endpointDoc(
       [{ id: "a", type: "condition", check: { field: "input.x", op: "==", value: 1 }, routes: { true: { action: "goto", target: "nowhere" } } }],
       {},
     );
-    assert.throws(() => compileEndpoint(doc), DefinitionError);
+    const failure = await failureOf(doc, { x: 1 });
+    assert.equal(failure.code, "ENDPOINT_ERROR.CONDITION");
+    assert.match(failure.message, /goto target "nowhere" is not a step in scope/);
   });
 });
 

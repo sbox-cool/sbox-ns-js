@@ -1,7 +1,7 @@
 import type { EndpointHandler, EndpointRequest, Ns, WorkflowFunction } from "../endpoint/types.js";
 import type { CollectionDefinition } from "../storage/types.js";
 import { resolveTemplate } from "./expression.js";
-import { DslResponse, newRunState, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
+import { DslResponse, newRunState, recordStepFinding, routeOf, runSteps, STEP_TYPES, type RunState, type StepDef } from "./steps.js";
 
 // Compiles declarative YAML documents (endpoint, workflow, collection) into the handler shapes the engine runs.
 // Documents are validated up front, so a document that compiles never fails for structural reasons at runtime.
@@ -47,8 +47,10 @@ function requireObject(value: unknown, path: string): Record<string, unknown> {
   return value;
 }
 
+const ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+
 function requireId(value: unknown, path: string): string {
-  if (typeof value !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(value)) {
+  if (typeof value !== "string" || !ID_PATTERN.test(value)) {
     throw new DefinitionError(path, "must be a lowercase id (a-z, 0-9, _ or -).");
   }
   return value;
@@ -65,8 +67,9 @@ function checkSourceVersion(doc: Record<string, unknown>, kind: string, path: st
   if (doc["kind"] !== kind) throw new DefinitionError(`${path}.kind`, `must be "${kind}".`);
 }
 
-// Validates a step list recursively. Step ids must be unique across the whole document. A goto target must name a step
-// in this list or in an enclosing list (`enclosing`).
+// Validates a step list recursively. A problem with one step is recorded as a finding on that step (recordStepFinding):
+// the step is stored and fails when it runs, as the hosted backend does. Step ids must be unique across the whole
+// document. A goto target must name a step in this list or in an enclosing list (`enclosing`).
 function validateSteps(steps: unknown, path: string, seen: Set<string>, enclosing: readonly string[]): void {
   if (!Array.isArray(steps)) throw new DefinitionError(path, "must be an array.");
   const entries = steps.map((raw, index) => {
@@ -74,31 +77,54 @@ function validateSteps(steps: unknown, path: string, seen: Set<string>, enclosin
     const step = requireObject(raw, at);
     const type = step["type"];
     if (typeof type !== "string" || !STEP_TYPES.includes(type)) {
-      throw new DefinitionError(`${at}.type`, `unsupported step type "${String(type)}".`);
+      recordStepFinding(step, `${at}.type: unsupported step type "${String(type)}".`);
     }
-    // A condition with no id is stored, not rejected: it answers ENDPOINT_ERROR.CONDITION when it runs (the hosted backend's behaviour).
-    const id = type === "condition" && step["id"] === undefined ? null : requireId(step["id"], `${at}.id`);
-    if (id !== null) {
-      if (seen.has(id)) throw new DefinitionError(`${at}.id`, `duplicate step id "${id}".`);
-      seen.add(id);
-    }
+    const id = stepIdOf(step, at, seen);
+    if (type === "condition" && step["check"] === undefined) recordStepFinding(step, `${at}.check: a condition needs a check.`);
     return { at, step, id, type };
   });
   const visible = [...enclosing, ...entries.flatMap((entry) => (entry.id === null ? [] : [entry.id]))];
   for (const { at, step, type } of entries) {
-    if (type === "block") validateSteps(step["steps"] ?? [], `${at}.steps`, seen, visible);
-    if (step["routes"] !== undefined) validateRoutes(step["routes"], `${at}.routes`, visible);
+    if (type === "block") {
+      const nested = step["steps"] ?? [];
+      if (Array.isArray(nested)) validateSteps(nested, `${at}.steps`, seen, visible);
+      else recordStepFinding(step, `${at}.steps: must be a list of steps.`);
+    }
+    if (step["routes"] !== undefined) validateRoutes(step, `${at}.routes`, visible);
   }
 }
 
-function validateRoutes(routes: unknown, path: string, visible: readonly string[]): void {
-  const table = requireObject(routes, path);
+// The step's id, or null when it is missing, malformed or already used. Each of those is a finding on the step.
+function stepIdOf(step: Record<string, unknown>, at: string, seen: Set<string>): string | null {
+  const id = step["id"];
+  if (typeof id !== "string" || !ID_PATTERN.test(id)) {
+    recordStepFinding(step, `${at}.id: must be a lowercase id (a-z, 0-9, _ or -).`);
+    return null;
+  }
+  if (seen.has(id)) {
+    recordStepFinding(step, `${at}.id: duplicate step id "${id}".`);
+    return null;
+  }
+  seen.add(id);
+  return id;
+}
+
+function validateRoutes(step: Record<string, unknown>, path: string, visible: readonly string[]): void {
+  const table = step["routes"];
+  if (!isObject(table)) {
+    recordStepFinding(step, `${path}: must be an object.`);
+    return;
+  }
   for (const [outcome, raw] of Object.entries(table)) {
-    if (outcome !== "true" && outcome !== "false") throw new DefinitionError(`${path}.${outcome}`, "must be true or false.");
+    const at = `${path}.${outcome}`;
+    if (outcome !== "true" && outcome !== "false") {
+      recordStepFinding(step, `${at}: must be true or false.`);
+      continue;
+    }
     const route = routeOf(raw, outcome === "true" ? "continue" : "reject");
-    if (route === null) throw new DefinitionError(`${path}.${outcome}`, "is not a valid route.");
-    if (route.action === "goto" && !visible.includes(route.target)) {
-      throw new DefinitionError(`${path}.${outcome}`, `goto target "${route.target}" is not a step in scope.`);
+    if (route === null) recordStepFinding(step, `${at}: is not a valid route.`);
+    else if (route.action === "goto" && !visible.includes(route.target)) {
+      recordStepFinding(step, `${at}: goto target "${route.target}" is not a step in scope.`);
     }
   }
 }

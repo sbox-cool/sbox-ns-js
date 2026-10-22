@@ -153,7 +153,15 @@ function asKeyOf(step: StepDef): string {
 }
 
 function stepErrorCode(step: StepDef): string {
-  return `ENDPOINT_ERROR.${step.type.toUpperCase()}`;
+  return `ENDPOINT_ERROR.${typeof step.type === "string" ? step.type.toUpperCase() : "STEP"}`;
+}
+
+// Findings from compile. A step with a finding is stored rather than rejected at sync; it fails with the step's error
+// code when it is reached, as the hosted backend does. The first finding recorded for a step is kept.
+const stepFindings = new WeakMap<object, string>();
+
+export function recordStepFinding(step: object, message: string): void {
+  if (!stepFindings.has(step)) stepFindings.set(step, message);
 }
 
 function scopeOf(state: RunState): EvalOptions {
@@ -542,9 +550,6 @@ function runStep(step: StepDef, state: RunState): Flow | null {
       return null;
     }
     case "condition": {
-      if (step.id === undefined || step["check"] === undefined) {
-        state.ns.fail(stepErrorCode(step), "A condition needs an id and a check.", 400);
-      }
       const passed = evaluateCond(step["check"], state);
       scope[step.id] = passed;
       const onFail = step["onFail"];
@@ -671,6 +676,8 @@ function runStep(step: StepDef, state: RunState): Flow | null {
 
 // Runs one step, converting an expression failure into a step failure as the reference does.
 function runStepGuarded(step: StepDef, state: RunState): Flow | null {
+  const finding = stepFindings.get(step);
+  if (finding !== undefined) state.ns.fail(stepErrorCode(step), finding, 400);
   try {
     return runStep(step, state);
   } catch (error) {
