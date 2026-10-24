@@ -1,0 +1,25 @@
+sourceVersion: 1
+kind: endpoint
+id: ts-probe
+slug: ts-probe
+name: TypeScript probe
+method: POST
+enabled: true
+requiresSecretKey: false
+exposure: public
+runtime: typescript
+script: |
+  interface ProbeInput {
+    value: number;
+    label?: string;
+  }
+
+  export default function handle(
+    req: { input: ProbeInput },
+    ns: { fail(code: string, message: string, status?: number): never },
+  ): { ok: boolean; doubled: number; label: string } {
+    const value: number = req.input.value;
+    if (!Number.isInteger(value)) ns.fail("INVALID_VALUE", "value must be an integer.", 400);
+    const label = (req.input.label ?? "none") as string;
+    return { ok: true, doubled: value * 2, label };
+  }

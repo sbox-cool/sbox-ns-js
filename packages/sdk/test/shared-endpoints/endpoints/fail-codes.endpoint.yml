@@ -1,0 +1,26 @@
+sourceVersion: 1
+kind: endpoint
+id: fail-codes
+slug: fail-codes
+name: Fail codes
+method: POST
+enabled: true
+requiresSecretKey: false
+exposure: public
+runtime: javascript
+script: |
+  export default function handle(req, ns) {
+    const mode = req.input.mode;
+    if (mode === "default") ns.fail("DEFAULT_STATUS", "defaults to 400.");
+    if (mode === "teapot") ns.fail("TEAPOT", "custom status.", 418);
+    if (mode === "server") ns.fail("SERVER_STATUS", "out of range.", 500);
+    if (mode === "empty-code") ns.fail("", "empty code.");
+    if (mode === "caught-fail") {
+      try { ns.fail("CAUGHT", "a caught ns.fail still ends the request.", 409); } catch (error) {}
+      return { ok: true, mode, after: "caught" };
+    }
+    if (mode === "caught-bad-status") {
+      try { ns.fail("BAD", "out of range.", 500); } catch (error) { return { ok: true, mode, caught: true }; }
+    }
+    return { ok: true, mode };
+  }

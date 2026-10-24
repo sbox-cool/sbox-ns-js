@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, issue150-portable-sdk]
+  pull_request:
+  # The server can change without a commit here; a nightly run catches a server change the SDK no longer matches.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+  generator-smoke:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Pack the SDK tarball
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --workspace packages/sdk --pack-destination "$RUNNER_TEMP/pack"
+      - name: Scaffold a fresh backend
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/backend"
+          node packages/create-sbox-ns-backend/dist/cli.js "$OUT" --project-id proj_ci --port 8787
+          TGZ="$(ls "$RUNNER_TEMP"/pack/*.tgz)"
+          cd "$OUT"
+          node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("package.json", "utf8")); p.dependencies["@sbox-ns/sdk"] = "file:" + process.argv[1]; fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");' "$TGZ"
+          npm install
+          npm test
+      - name: Refuse a non-empty target
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/occupied"
+          mkdir -p "$OUT"
+          echo keep > "$OUT/keep.txt"
+          if node packages/create-sbox-ns-backend/dist/cli.js "$OUT" --project-id proj_ci; then
+            echo "generator wrote into a non-empty directory" >&2
+            exit 1
+          fi
+          test "$(cat "$OUT/keep.txt")" = "keep"
+
+  # The .NET server at main is the reference: the HTTP contract corpus and the shared scripted-endpoint suite must answer
+  # the same on both backends, on SQLite and PostgreSQL. A server change that the SDK does not match fails this job.
+  server-conformance:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sbox-cool/sbox-network-storage-server
+          ref: main
+          path: reference
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: npm ci
+      - run: npm run build
+      - name: Build the reference server
+        run: dotnet build reference/SboxNetworkStorage.sln -c Release
+      - name: Install the PostgreSQL driver for the SDK side
+        run: npm install --prefix "$RUNNER_TEMP/pgdrv" pg@8
+      - name: Corpus parity (SQLite)
+        run: bash scripts/parity.sh --reference reference --out "$RUNNER_TEMP/parity-sqlite"
+      - name: Corpus parity (PostgreSQL)
+        run: >-
+          bash scripts/parity.sh --reference reference --storage postgres
+          --postgres-admin postgres://postgres@127.0.0.1:5432/postgres
+          --pg-driver "$RUNNER_TEMP/pgdrv/node_modules/pg" --out "$RUNNER_TEMP/parity-postgres"
+          --ref-port 18431 --sdk-port 18432
+      - name: Shared scripted endpoints
+        run: bash scripts/shared-endpoints.sh --reference reference --out "$RUNNER_TEMP/shared-endpoints"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-conformance
+          path: |
+            ${{ runner.temp }}/parity-sqlite
+            ${{ runner.temp }}/parity-postgres
+            ${{ runner.temp }}/shared-endpoints
+          if-no-files-found: ignore

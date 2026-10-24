@@ -1,0 +1,16 @@
+{
+  // Recipe for createKvStorage. `main` is the harness Worker used by the SDK conformance run.
+  // A production Worker uses the same bindings and re-exports StorageCoordinator.
+  "name": "ns-kv-storage-harness",
+  "main": "harness/worker.ts",
+  "compatibility_date": "2026-10-20",
+  "durable_objects": {
+    "bindings": [{ "name": "COORDINATOR", "class_name": "StorageCoordinator" }]
+  },
+  // SQLite-backed class: required for ctx.storage.sql and transactionSync used by the coordinator.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["StorageCoordinator"] }],
+  // Payload blobs. Create with: wrangler kv namespace create ns-storage-blobs
+  "kv_namespaces": [{ "binding": "BLOBS", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
+  // D1 database for the D1 backend. Create with: wrangler d1 create ns-storage-harness (then set database_id).
+  "d1_databases": [{ "binding": "DB", "database_name": "ns-storage-harness", "database_id": "REPLACE_WITH_D1_DATABASE_ID" }]
+}

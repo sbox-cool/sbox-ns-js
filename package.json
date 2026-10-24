@@ -1,0 +1,23 @@
+{
+  "name": "sbox-ns-js",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Backend SDK and scaffolder for sbox-ns (Network Storage for s&box).",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^20.16.0"
+  }
+}
