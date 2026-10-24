@@ -2,12 +2,16 @@
 # Runs on windows-latest. The server repo (sbox-network-storage-server, main) supplies tools/sbox-cli-e2e/run.cs.
 # This script packs the SDK and the generator from this checkout, scaffolds a new backend, starts it on
 # 127.0.0.1:8080, and runs the harness in --server-url mode once per library target.
+# Harness default is durable: the backend runs with CONTROL_STATE_FILE (SQLite control state) and restarts between
+# library legs. -ControlState memory exercises the in-memory baseline. The generated app itself stays memory-only unless
+# CONTROL_STATE_FILE is set in its environment, so this default lives in the harness, not the generator or server.
 param(
   [Parameter(Mandatory = $true)][string]$Engine,        # <sbox-public>/game (contains sbox-server.exe)
   [Parameter(Mandatory = $true)][string]$ServerDir,     # sbox-network-storage-server checkout (working tree)
   [Parameter(Mandatory = $true)][string]$Out,           # artifact directory
   [string[]]$Libraries = @("main", "latest"),           # "main", "latest" (highest published r<N>), or "r<N>"
-  [int]$Port = 8080
+  [int]$Port = 8080,
+  [ValidateSet("memory", "sqlite")][string]$ControlState = "sqlite"  # "sqlite" (default): durable control state; "memory": baseline
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,29 +87,54 @@ Write-Host "::add-mask::$secretKey"
 Write-Host "project: $projectId"
 
 # 5. Start the backend. node:sqlite needs Node 22.13+ (provided by setup-node in the workflow).
-$backendLog = Join-Path $out "backend.log"
-$backendErr = Join-Path $out "backend.err.log"
-$backendProc = Start-Process -FilePath "node" -ArgumentList @("--experimental-sqlite", "--env-file=.env", "dist/server.js") `
-  -WorkingDirectory $backend -RedirectStandardOutput $backendLog -RedirectStandardError $backendErr -PassThru -NoNewWindow
-
-try {
+# CONTROL_STATE_FILE opts the generated backend into durable SQLite control state; "memory" removes it.
+$durable = $ControlState -eq "sqlite"
+$env:CONTROL_STATE_FILE = if ($durable) { "data/control-state.sqlite" } else { $null }
+$controlState = if ($durable) { "sqlite" } else { "memory" }
+$startCount = 0
+function Start-Backend {
+  $script:startCount++
+  $log = Join-Path $out ("backend-start-" + $script:startCount + ".log")
+  $errLog = Join-Path $out ("backend-start-" + $script:startCount + ".err.log")
+  $proc = Start-Process -FilePath "node" -ArgumentList @("--experimental-sqlite", "--env-file=.env", "dist/server.js") `
+    -WorkingDirectory $backend -RedirectStandardOutput $log -RedirectStandardError $errLog -PassThru -NoNewWindow
   $deadline = (Get-Date).AddSeconds(90)
-  $ready = $false
   while ((Get-Date) -lt $deadline) {
-    if ($backendProc.HasExited) { throw "backend exited early with code $($backendProc.ExitCode); see backend.err.log" }
+    if ($proc.HasExited) { throw "backend exited early with code $($proc.ExitCode); see $errLog" }
     try {
       $info = Invoke-RestMethod -Uri "$baseUrl/v3/server-info" -TimeoutSec 5
-      if ($null -ne $info.capabilities) { $ready = $true; break }
+      if ($null -ne $info.capabilities) { return @{ Proc = $proc; Info = $info } }
     } catch { }
     Start-Sleep -Seconds 2
   }
-  if (-not $ready) { throw "backend did not answer /v3/server-info within 90s" }
-  Write-Host "backend ready at $baseUrl"
-  $info | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $out "server-info.json")
+  Stop-Process -Id $proc.Id -Force
+  throw "backend did not answer /v3/server-info within 90s"
+}
+# Settings and definitions as the running backend serves them. The restart check compares two of these.
+function Get-Snapshot {
+  $headers = @{ "x-api-key" = $secretKey }
+  $snapshot = [ordered]@{}
+  foreach ($part in @("settings", "endpoints", "collections", "workflows")) {
+    $snapshot[$part] = Invoke-RestMethod -Uri "$baseUrl/v3/manage/$projectId/$part" -Headers $headers -TimeoutSec 30
+  }
+  # Persisted JSON object keys may be reordered; compare semantic snapshots, not property insertion order.
+  $json = $snapshot | ConvertTo-Json -Depth 50 -Compress
+  $canonical = $json | & node -e 'const fs = require("node:fs"); const sort = v => Array.isArray(v) ? v.map(sort) : v !== null && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map(k => [k, sort(v[k])])) : v; process.stdout.write(JSON.stringify(sort(JSON.parse(fs.readFileSync(0, "utf8")))));'
+  if ($LASTEXITCODE -ne 0) { throw "snapshot normalization failed" }
+  return $canonical
+}
 
-  # 6. Run the server's harness against this backend, once per library target.
+try {
+  $started = Start-Backend
+  $backendProc = $started.Proc
+  Write-Host "backend ready at $baseUrl (control state: $controlState)"
+  $started.Info | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $out "server-info.json")
+
+  # 6. Run the server's harness against this backend, once per library target. A durable run restarts the backend
+  # after each leg and requires settings and definitions to read back identically, so recovery is exercised.
   $sdkSha = (& git -C $root rev-parse HEAD).Trim()
   $failed = @()
+  $restarts = @()
   Push-Location $ServerDir
   $serverSha = (& git rev-parse HEAD).Trim()
   foreach ($lib in $resolved) {
@@ -118,6 +147,18 @@ try {
     $code = $LASTEXITCODE
     Write-Host "library $lib exit $code"
     if ($code -ne 0) { $failed += $lib }
+    if ($durable) {
+      $before = Get-Snapshot
+      Stop-Process -Id $backendProc.Id -Force
+      $backendProc.WaitForExit(15000) | Out-Null
+      $backendProc = (Start-Backend).Proc
+      $after = Get-Snapshot
+      Set-Content -Path (Join-Path $out "restart-$lib-before.json") -Value $before
+      Set-Content -Path (Join-Path $out "restart-$lib-after.json") -Value $after
+      if ($before -ne $after) { throw "backend restart after library $lib did not restore settings and definitions; see restart-$lib-*.json" }
+      $restarts += $lib
+      Write-Host "restart after library $lib restored settings and definitions"
+    }
   }
   Pop-Location
 
@@ -128,9 +169,11 @@ try {
     server_commit = $serverSha
     libraries = $resolved
     failed = $failed
+    control_state = $controlState
+    restarted_after = $restarts
   } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $out "run-meta.json")
 
   if ($failed.Count -gt 0) { throw "engine leg failed for: $($failed -join ', ')" }
 } finally {
-  if (-not $backendProc.HasExited) { Stop-Process -Id $backendProc.Id -Force }
+  if ($backendProc -and -not $backendProc.HasExited) { Stop-Process -Id $backendProc.Id -Force }
 }

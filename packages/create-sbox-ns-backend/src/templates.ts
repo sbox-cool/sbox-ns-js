@@ -61,6 +61,7 @@ export interface Config {
   sessionSecret: string;
   signingPrivateKeyPem: string;
   dataFile: string;
+  controlStateFile?: string;
   requestKeysFile: string;
   definitionsDir: string;
   fetchAllowedHosts: readonly string[];
@@ -87,6 +88,7 @@ export function loadConfig(env: Env, root: string): Config {
   const secretKey = required("SECRET_KEY");
   if (publicKey === secretKey) throw new Error("PUBLIC_KEY and SECRET_KEY must differ.");
 
+  const controlFile = env["CONTROL_STATE_FILE"];
   return {
     projectId: required("PROJECT_ID"),
     publicKey,
@@ -94,6 +96,7 @@ export function loadConfig(env: Env, root: string): Config {
     sessionSecret: required("SESSION_SECRET"),
     signingPrivateKeyPem: readFileSync(resolve(root, env["SIGNING_KEY_FILE"] ?? "keys/signing-private.pem"), "utf8"),
     dataFile: resolve(root, env["DATA_FILE"] ?? "data/sbox-ns.sqlite"),
+    ...(controlFile === undefined || controlFile.trim() === "" ? {} : { controlStateFile: resolve(root, controlFile) }),
     requestKeysFile: resolve(root, env["REQUEST_KEYS_FILE"] ?? "data/request_encryption_keys.json"),
     definitionsDir: resolve(root, env["DEFINITIONS_DIR"] ?? "Editor/Network Storage"),
     fetchAllowedHosts: splitList(env["FETCH_ALLOWED_HOSTS"]),
@@ -112,7 +115,7 @@ function splitList(value: string | undefined): string[] {
 
 const STORAGE_TS = `import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { createSqliteStorage, type SqliteDatabase } from "@sbox-ns/sdk/storage";
+import { createSqliteControlStateStore, createSqliteStorage, type SqliteDatabase } from "@sbox-ns/sdk/storage";
 import type { ServerOptions } from "@sbox-ns/sdk/server";
 
 // Bun ships bun:sqlite; Node 22.13+ ships node:sqlite (--experimental-sqlite covers Node 22.5 to 22.12).
@@ -143,6 +146,13 @@ export async function openStorage(file: string): Promise<ServerOptions["storage"
       collections: definition.collections,
       values: definition.values,
     });
+}
+
+// Durable control state (opt-in via CONTROL_STATE_FILE) gets its own database file, so control commits never share
+// a transaction with endpoint records.
+export async function openControlState(file: string): Promise<NonNullable<ServerOptions["controlState"]>> {
+  const db = await openDatabase(file);
+  return { store: createSqliteControlStateStore({ db }) };
 }
 `;
 
@@ -242,11 +252,12 @@ import { endpoints } from "./endpoints.js";
 import { ensureRequestKeyRing, nodeFetchPolicy } from "@sbox-ns/sdk/node";
 import { globals } from "./globals.js";
 import { modules } from "./modules.js";
-import { openStorage } from "./storage.js";
+import { openControlState, openStorage } from "./storage.js";
 
 export interface App {
   server: NetworkStorageServer;
   options: ServerOptions;
+  syncDefinitionsOnStart: boolean;
 }
 
 // Server options for this project without catalog modules. Tests use this to exercise installModules.
@@ -263,6 +274,7 @@ export async function buildOptions(config: Config): Promise<ServerOptions> {
     endpoints,
     globals,
     storage: await openStorage(config.dataFile),
+    ...(config.controlStateFile === undefined ? {} : { controlState: await openControlState(config.controlStateFile) }),
     parseYaml: parse,
     fetchPolicy: nodeFetchPolicy(config.fetchAllowedHosts),
     replayStore: createMemoryReplayStore(),
@@ -272,7 +284,8 @@ export async function buildOptions(config: Config): Promise<ServerOptions> {
 // The running app: code endpoints, shared globals, and the catalog modules wired in-process.
 export async function createApp(config: Config): Promise<App> {
   const options = withModules(await buildOptions(config), modules);
-  return { server: createNetworkStorageServer(options), options };
+  const persisted = options.controlState === undefined ? null : await options.controlState.store.load(config.projectId);
+  return { server: createNetworkStorageServer(options), options, syncDefinitionsOnStart: persisted === null };
 }
 `;
 
@@ -301,6 +314,7 @@ dev.__sboxNsDev = state;
 
 const config = loadConfig(process.env, process.cwd());
 const app = await createApp(config);
+await app.server.ready;
 const http = createServer(nodeHandler(app.server));
 state.http = http;
 await new Promise<void>((resolve, reject) => {
@@ -314,7 +328,8 @@ const client = createSboxNsClient({
   projectId: config.projectId,
   secretKey: config.secretKey,
 });
-await syncDefinitions(client, config.definitionsDir);
+// Persisted control state wins over bootstrap files on restart. File edits still trigger an explicit re-sync below.
+if (app.syncDefinitionsOnStart) await syncDefinitions(client, config.definitionsDir);
 console.log("sbox-ns backend listening on " + config.host + ":" + String(config.port));
 
 // Re-sync when a definition file changes. Debounced so an editor save writes once.

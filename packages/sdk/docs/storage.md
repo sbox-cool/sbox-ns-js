@@ -144,6 +144,32 @@ Reads take metadata from the coordinator, then fetch the blob. If the blob is mi
 
 See `recipes/cloudflare-kv/README.md`. It requires a `COORDINATOR` Durable Object binding, a `BLOBS` KV namespace, and (for the D1 harness) a `DB` D1 binding.
 
+## Durable control state
+
+Managed settings and the catalog definitions (endpoints, collections, workflows, game values, queries, tests, rate limits, and module-composed records) are in memory by default, as before. To keep them across restarts, pass `controlState` to `createNetworkStorageServer`:
+
+```ts
+import { createSqliteControlStateStore } from "@sbox-ns/sdk/storage";
+
+const store = createSqliteControlStateStore({ db }); // db: a node:sqlite DatabaseSync
+const app = createNetworkStorageServer({ ...options, controlState: { store } });
+await app.ready; // resolves after the persisted state loads; fetch waits for it too
+```
+
+`createPostgresControlStateStore({ pool })` is the PostgreSQL equivalent. The SQLite store opens its own connection, sets `synchronous = FULL`, and commits each write in `BEGIN IMMEDIATE`.
+
+- **Document.** One JSON document per project holds the whole live catalog and settings. It has a `schemaVersion`, the `projectId`, and a SHA-256 checksum of the text. A per-project `version` counter gives compare-and-swap, separate from the catalog `revision`.
+- **Startup.** `startup: "restore"` (the default) loads the persisted state. Persisted settings take precedence over `ServerOptions.settings`, and the difference is logged as `control-state.settings-ignored`. With nothing persisted, the options seed version 1. `startup: "reset"` replaces the persisted state with the options seed. `startup: "import"` loads a `snapshot` string from `exportControlState()`, and it is refused when the snapshot belongs to another project.
+- **Writes.** A write is applied to a copy of the catalog and becomes live only after the save is acknowledged. A rejected save leaves the old state visible. If an acknowledgement is lost, the writer reloads: an exact stored match is adopted, a confirmed unchanged base returns an error without adoption, and an unreadable or conflicting result makes the process refuse further reads and writes until restart. The restart restores the last committed state.
+- **Refusals.** A checksum mismatch, invalid JSON, an unknown `schemaVersion`, or another project's document makes `ready` reject with `ControlStateError`. The server does not start on top of unreadable state.
+- **Host code and modules.** Managed records pushed by a module installer are part of the persisted catalog. Host-supplied `ServerOptions.endpoints`, `globals`, `values`, and `withModules` code are not serialized and still come from the host program on every start. Reset clears the managed catalog and restores seed settings; it does not snapshot or restore JavaScript functions.
+- **Single writer.** One process may write a project's control state at a time. The version check fences a stale second writer, so it fails instead of overwriting, but it does not coordinate multiple instances.
+- **Not included.** Transient sync-job history is not durable. There is no multi-instance coordination, and no new provider claims.
+
+The generated backend opts in with `CONTROL_STATE_FILE` (see `create-sbox-ns-backend`). Unset, it stays in memory. In durable mode it awaits recovery before listening and imports bootstrap definition files only when no persisted document exists; subsequent starts retain managed changes. Explicit file edits while running still trigger the existing sync watcher.
+
+The engine harness (`scripts/ci/engine-leg.ps1`) defaults to `-ControlState sqlite`: it runs each library leg against a SQLite control-state file, restarts the backend between legs, and fails the leg if the settings or definitions snapshot differs after the restart. `-ControlState memory` is the baseline. The generated app remains memory unless `CONTROL_STATE_FILE` is set; the durable default applies to the harness only.
+
 ## Verification
 
 Run from `packages/sdk`:

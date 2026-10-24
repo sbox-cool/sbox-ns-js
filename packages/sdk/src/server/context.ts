@@ -3,6 +3,7 @@ import type { SecuritySettings } from "../protocol/config.js";
 import type { EndpointStorage } from "../storage/types.js";
 import { createCatalog, stagedCatalogOf, storageDefinitionOf, valuesOf, type Catalog } from "./catalog.js";
 import { createConfigSource, type ConfigSource } from "./config.js";
+import { openDurableControl, type ControlDraft, type DurableControl } from "./control-state.js";
 import type { ServerOptions, SessionRevocations, ValuesDocument } from "./options.js";
 import { createSyncJobs, type SyncJobs } from "./sync-jobs.js";
 
@@ -33,9 +34,17 @@ export interface ServerContext {
   storage(): EndpointStorage;
   // The runtime for a publish target. next=false reads the live catalog; next=true reads it with the staged revision applied.
   view(next: boolean): RuntimeView;
-  // The settings management writes replace. Requests read them per call, so a change applies to the next request.
+  // The settings management writes change. Requests read them per call, so a change applies to the next request.
   settings(): ManagedSettings;
-  replaceSettings(next: ManagedSettings): void;
+  // Runs one control mutation. In durable mode `work` runs on a copy and nothing becomes visible until the write is
+  // acknowledged. In memory mode it runs on the live state, so `work` validates before it mutates.
+  commit<T>(work: (draft: ControlDraft) => T): Promise<T>;
+  // Resolves once durable control state is loaded. Always resolved in memory mode.
+  readonly ready: Promise<void>;
+  // The persisted control document. Durable mode only.
+  exportControlState(): Promise<string>;
+  // Throws when a durable commit could not be confirmed; the process then fails closed until restart.
+  assertHealthy(): void;
 }
 
 // In-process revocation list. Entries live until their session would have expired anyway. Multi-instance
@@ -59,6 +68,33 @@ export function createServerContext(options: ServerOptions): ServerContext {
   let cached: { readonly revision: number; readonly storage: EndpointStorage } | null = null;
   let overlay: { readonly revision: number; readonly view: RuntimeView } | null = null;
   let managed: ManagedSettings = { security: options.settings, requireSboxAuth: options.requireSboxAuth ?? false };
+  // Durable mode: writes go through the store, and the live catalog is replaced only once a write is acknowledged.
+  const durable: DurableControl | null =
+    options.controlState === undefined
+      ? null
+      : openDurableControl({
+          projectId: options.projectId,
+          options: options.controlState,
+          seed: managed,
+          parseYaml: options.parseYaml,
+          catalog,
+          settings: () => managed,
+          adopt: (next) => {
+            managed = next;
+          },
+          log: options.log,
+        });
+  // Memory mode: work runs against the live state synchronously, as it always has.
+  const memoryCommit = <T>(work: (draft: ControlDraft) => T): Promise<T> => {
+    const draft: ControlDraft = { catalog, settings: managed };
+    try {
+      const result = work(draft);
+      managed = draft.settings;
+      return Promise.resolve(result);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
   const liveStorage = (): EndpointStorage => {
     if (cached === null || cached.revision !== catalog.revision) {
       cached = { revision: catalog.revision, storage: options.storage(storageDefinitionOf(catalog, values())) };
@@ -84,9 +120,11 @@ export function createServerContext(options: ServerOptions): ServerContext {
       return overlay.view;
     },
     settings: () => managed,
-    replaceSettings(next) {
-      managed = next;
-    },
+    commit: durable === null ? memoryCommit : durable.commit,
+    ready: durable === null ? Promise.resolve() : durable.ready,
+    exportControlState: () =>
+      durable === null ? Promise.reject(new Error("exportControlState requires ServerOptions.controlState.")) : durable.exportState(),
+    assertHealthy: () => durable?.assertHealthy(),
   };
 }
 

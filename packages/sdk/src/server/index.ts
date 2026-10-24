@@ -14,6 +14,11 @@ export type { ServerOptions, SessionRevocations, ValuesDocument } from "./option
 
 export interface NetworkStorageServer {
   fetch(request: Request): Promise<Response>;
+  // Resolves once durable control state is loaded. Resolved from the start when ServerOptions.controlState is unset.
+  // Rejects when startup fails closed; every request then answers with an error until the process restarts.
+  readonly ready: Promise<void>;
+  // The persisted control document, for backup or import. Rejects without ServerOptions.controlState.
+  exportControlState(): Promise<string>;
 }
 
 // Builds the network-storage HTTP surface over the Fetch API. The result runs on any runtime that has Request and
@@ -21,8 +26,12 @@ export interface NetworkStorageServer {
 export function createNetworkStorageServer(options: ServerOptions): NetworkStorageServer {
   const ctx = createServerContext(options);
   return {
+    ready: ctx.ready,
+    exportControlState: () => ctx.exportControlState(),
     async fetch(request: Request): Promise<Response> {
       try {
+        await ctx.ready;
+        ctx.assertHealthy();
         return await route(ctx, request);
       } catch (error) {
         if (error instanceof KeyRefusal) return keyFailureResponse(familyOf(request), request, new URL(request.url));
