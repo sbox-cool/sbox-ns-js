@@ -603,6 +603,46 @@ export function upsertGameValues(catalog: Catalog, items: readonly Record<string
   catalog.revision += 1;
 }
 
+// A copy of the catalog for a commit to work on. Stored entries and records are never mutated, so the copy shares them
+// and only the containers are new.
+export function cloneCatalog(source: Catalog): Catalog {
+  return {
+    revision: source.revision,
+    endpoints: new Map(source.endpoints),
+    collections: new Map(source.collections),
+    workflows: new Map(source.workflows),
+    queries: new Map(source.queries),
+    gameValues: new Map(source.gameValues),
+    constantGroups: new Map(source.constantGroups),
+    rateLimitRules: [...source.rateLimitRules],
+    tests: [...source.tests],
+    gamePackage: source.gamePackage,
+    staged: { endpoints: new Map(source.staged.endpoints), collections: new Map(source.staged.collections) },
+  };
+}
+
+// Swaps a committed draft into the live catalog. The live object keeps its identity so holders of it see the new
+// contents. The revision moves past both sides, so storage cached on the old revision is rebuilt.
+export function replaceCatalogContents(target: Catalog, source: Catalog): void {
+  target.revision = Math.max(source.revision, target.revision + 1);
+  replaceMapContents(target.endpoints, source.endpoints);
+  replaceMapContents(target.collections, source.collections);
+  replaceMapContents(target.workflows, source.workflows);
+  replaceMapContents(target.queries, source.queries);
+  replaceMapContents(target.gameValues, source.gameValues);
+  replaceMapContents(target.constantGroups, source.constantGroups);
+  target.rateLimitRules = source.rateLimitRules;
+  target.tests = source.tests;
+  target.gamePackage = source.gamePackage;
+  replaceMapContents(target.staged.endpoints, source.staged.endpoints);
+  replaceMapContents(target.staged.collections, source.staged.collections);
+}
+
+function replaceMapContents<K, V>(target: Map<K, V>, source: ReadonlyMap<K, V>): void {
+  target.clear();
+  for (const [key, value] of source) target.set(key, value);
+}
+
 // The stored record for one id, or undefined when no such resource exists.
 export function documentOf(catalog: Catalog, kind: ResourceKind, id: string): Record<string, unknown> | undefined {
   const entry = kind === "endpoints" ? catalog.endpoints.get(id) : kind === "collections" ? catalog.collections.get(id) : catalog.workflows.get(id);

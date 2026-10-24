@@ -20,6 +20,8 @@ Output:
 - `.env` (mode 0600) holds the secret key, the session secret, and the paths. Never put the secret key in game code.
 - `keys/signing-private.pem` (mode 0600) is an RSA 2048 signing key, generated locally.
 - `data/request_encryption_keys.json` is not written by the generator. The backend creates it (mode 0600) on first start, holding the RSA request key for v2 encrypted requests.
+- Durable control state is opt-in. Add `CONTROL_STATE_FILE=<path>` to `.env` to keep managed settings and endpoint, collection, workflow, and game-value definitions in a SQLite file across restarts. Unset, they stay in memory and reset on restart, as before. Only one process may write a given file.
+  With durability enabled, disk definitions seed the first start only; persisted definitions win on later starts. Editing a definition file while the process is running still requests a sync. The app awaits control-state recovery before opening its listener and refuses unreadable state instead of starting empty.
 
 Requirements: Node 20+ to run the generator. The generated project needs Bun 1.1+ or Node 22.13+ (for `node:sqlite`).
 

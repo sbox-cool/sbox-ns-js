@@ -21,8 +21,9 @@ import {
   type RecordCheck,
   type StoredQuery,
   type ResourceKind,
+  type Catalog,
 } from "./catalog.js";
-import type { RuntimeView, ServerContext } from "./context.js";
+import type { ManagedSettings, RuntimeView, ServerContext } from "./context.js";
 import { authorize, executeEndpoint, resolveEndpoint } from "./endpoints.js";
 import { KeyRefusal, UnknownRoute } from "./auth-failure.js";
 import { applySettingsText, managementSettingsView } from "./management-settings.js";
@@ -97,7 +98,7 @@ function kindOfPath(segment: string | undefined): ResourceKind | null {
 
 // One section of a request, checked record by record. A non-array value fails the section, never the request. Nothing
 // is committed unless every section passed.
-function compileSection(ctx: ServerContext, kind: ResourceKind, value: unknown): Section {
+function compileSection(ctx: ServerContext, catalog: Catalog, kind: ResourceKind, value: unknown): Section {
   if (!Array.isArray(value)) {
     const shapeError = `${KIND_LABEL[kind]}s must be an array`;
     return { kind, shapeError, items: [], compiled: [], ok: false, message: shapeError };
@@ -106,7 +107,7 @@ function compileSection(ctx: ServerContext, kind: ResourceKind, value: unknown):
   const faults = items.flatMap((item) => (item.check.ok ? [] : [item.check.fault]));
   const compiled = items.flatMap((item) => (item.check.ok ? [item.check.item] : []));
   // Cross-document script checks run once every record compiles, over the catalog with this section applied.
-  const graph = faults.length === 0 && kind === "endpoints" ? scriptGraphFault(ctx.catalog, compiled) : null;
+  const graph = faults.length === 0 && kind === "endpoints" ? scriptGraphFault(catalog, compiled) : null;
   if (graph !== null) faults.push({ stage: "definition", code: graph.code, message: graph.message, sourcePath: null, suggestedFix: null });
   return {
     kind,
@@ -155,7 +156,7 @@ function nameWarnings(kind: ResourceKind, stored: Readonly<Record<string, unknow
 // One record's report. Sync answers the upsert or the fault that stopped it. Preflight answers the diagnostics a write
 // would raise, and would_create or would_update for a record that passes.
 function itemReport(
-  ctx: ServerContext,
+  catalog: Catalog,
   kind: ResourceKind,
   item: SectionItem,
   mode: "sync" | "preflight",
@@ -176,18 +177,18 @@ function itemReport(
   }
   const resourceId = previewId(kind, check.stored, item.slot);
   const diagnostics = nameWarnings(kind, check.stored, resourceId);
-  const action = documentOf(ctx.catalog, kind, check.item.id) === undefined ? "would_create" : "would_update";
+  const action = documentOf(catalog, kind, check.item.id) === undefined ? "would_create" : "would_update";
   return { report: { ok: true, resourceKind: label, resourceId, action, diagnostics }, warnings: diagnostics.length };
 }
 
 // One section's report. A non-array section fails with its message. Otherwise every record reports; a failing section
 // makes the request a 400.
-function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "preflight"): Record<string, unknown> {
+function sectionReport(catalog: Catalog, section: Section, mode: "sync" | "preflight"): Record<string, unknown> {
   if (section.shapeError !== null) {
     const failure = { ok: false, error: "VALIDATION_FAILED", message: section.shapeError, results: [] };
     return mode === "preflight" ? { ...failure, total: 0, passed: 0, failed: 1, warnings: 0 } : failure;
   }
-  const reports = section.items.map((item) => itemReport(ctx, section.kind, item, mode));
+  const reports = section.items.map((item) => itemReport(catalog, section.kind, item, mode));
   const results = reports.map((entry) => entry.report);
   if (mode === "sync") return { ok: section.ok, total: results.length, results };
   const failed = section.items.filter((item) => !item.check.ok).length;
@@ -197,13 +198,13 @@ function sectionReport(ctx: ServerContext, section: Section, mode: "sync" | "pre
 
 // Builds the response for a set of sections. A failing section returns 400 and nothing is committed by the caller.
 function sectionsResponse(
-  ctx: ServerContext,
+  catalog: Catalog,
   sections: readonly Section[],
   mode: "sync" | "preflight",
   decision: PublishDecision,
 ): Response {
   const reports: Record<string, Record<string, unknown>> = {};
-  for (const section of sections) reports[section.kind] = sectionReport(ctx, section, mode);
+  for (const section of sections) reports[section.kind] = sectionReport(catalog, section, mode);
   const ok = sections.every((section) => section.ok);
   if (mode === "preflight") return preflightResponse(reports, ok, decision === "staged" ? "next" : "live");
   return jsonResponse(withPublishTarget({ ok, source: "candidate", ...reports }, decision), ok ? 200 : 400);
@@ -273,7 +274,7 @@ export async function handleManage(
   requireSecret(ctx, request);
   if (head === "validate" && rest.length === 1 && method === "GET") return validateRoute(ctx, request);
   if ((head === "settings" || head === "config") && rest.length === 1 && method === "GET") {
-    return jsonResponse(settingsResponse(ctx), 200);
+    return jsonResponse(settingsResponse(ctx, ctx.settings()), 200);
   }
   if (head === "settings" && rest.length === 1 && method === "PUT") return putSettings(ctx, request);
   if (head === "game-values" && rest.length === 1) return gameValuesRoute(ctx, request);
@@ -305,8 +306,10 @@ export async function handleManage(
     return putRateLimits(ctx, request);
   }
   if (head === "rate-limit-rules" && rest.length === 1 && method === "DELETE") {
-    ctx.catalog.rateLimitRules = [];
-    return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "delete" }, 200);
+    return ctx.commit((draft) => {
+      draft.catalog.rateLimitRules = [];
+      return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "delete" }, 200);
+    });
   }
   if (head === "queries") return queriesRoute(ctx, request, rest);
   const kind = kindOfPath(head);
@@ -343,8 +346,8 @@ function validateRoute(ctx: ServerContext, request: Request): Response {
 }
 
 // Settings and config are the same document: the settings under both keys, plus the two flags the library reads.
-function settingsResponse(ctx: ServerContext): Record<string, unknown> {
-  const settings = managementSettingsView(ctx.settings());
+function settingsResponse(ctx: ServerContext, source: ManagedSettings): Record<string, unknown> {
+  const settings = managementSettingsView(source);
   return {
     ok: true,
     projectId: ctx.options.projectId,
@@ -368,8 +371,10 @@ async function gameValuesRoute(ctx: ServerContext, request: Request): Promise<Re
     }
     records.push(item);
   }
-  upsertGameValues(ctx.catalog, records);
-  return jsonResponse({ ok: true, action: "upsert", resourceKind: "game-values", source: "candidate" }, 200);
+  return ctx.commit((draft) => {
+    upsertGameValues(draft.catalog, records);
+    return jsonResponse({ ok: true, action: "upsert", resourceKind: "game-values", source: "candidate" }, 200);
+  });
 }
 
 async function preflight(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
@@ -382,19 +387,22 @@ async function preflight(ctx: ServerContext, request: Request, url: URL): Promis
     }
     throw error;
   }
-  const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
-  return sectionsResponse(ctx, sections, "preflight", targetsNext(request, url) ? "staged" : "live");
+  const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, ctx.catalog, kind, body[kind]));
+  return sectionsResponse(ctx.catalog, sections, "preflight", targetsNext(request, url) ? "staged" : "live");
 }
 
 async function syncAll(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   const body = await readJsonBody(request);
-  const decision = decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
-  const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, kind, body[kind]));
-  // All-or-nothing across kinds: nothing is committed unless every section compiled.
-  if (sections.every((section) => section.ok)) {
-    for (const section of sections) writeCompiled(ctx.catalog, section.compiled, decision === "staged");
-  }
-  return sectionsResponse(ctx, sections, "sync", decision);
+  const next = targetsNext(request, url);
+  return ctx.commit((draft) => {
+    const decision = decidePublish(next, draft.catalog.gamePackage);
+    const sections = KINDS.filter((kind) => Object.hasOwn(body, kind)).map((kind) => compileSection(ctx, draft.catalog, kind, body[kind]));
+    // All-or-nothing across kinds: nothing is committed unless every section compiled.
+    if (sections.every((section) => section.ok)) {
+      for (const section of sections) writeCompiled(draft.catalog, section.compiled, decision === "staged");
+    }
+    return sectionsResponse(draft.catalog, sections, "sync", decision);
+  });
 }
 
 // A failed write answers 400 with the reference's error envelope and commits nothing.
@@ -412,8 +420,7 @@ function writeFailure(kind: ResourceKind, message: string | null, decision: Publ
 // answers 202 without a publish target.
 async function asyncEndpointSync(ctx: ServerContext, request: Request, url: URL): Promise<Response> {
   const text = await readBodyText(request);
-  const decision = decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
-  const jobId = startEndpointSync(ctx, text, decision, url.searchParams.get("replaceAll") === "true");
+  const jobId = startEndpointSync(ctx, text, targetsNext(request, url), url.searchParams.get("replaceAll") === "true");
   return jsonResponse({ ok: true, jobId, status: "accepted", message: SYNC_JOB_MESSAGE_ACCEPTED }, 202);
 }
 
@@ -429,66 +436,76 @@ async function kindRoute(
   if (rest.length === 1 && method === "GET") {
     return jsonResponse({ ok: true, data: documentsOf(ctx, kind, includeStagedOf(url)) }, 200);
   }
-  // Workflows have no staged revision and always publish live.
-  const decision: PublishDecision =
-    kind === "workflows" ? "live" : decidePublish(targetsNext(request, url), ctx.catalog.gamePackage);
-  const staged = decision === "staged";
+  // Workflows have no staged revision and always publish live. The publish target is decided inside each commit, from
+  // the catalog the write lands on.
+  const next = targetsNext(request, url);
   if (rest.length === 1 && method === "PUT") {
     if (kind === "endpoints" && url.searchParams.get("async") === "true") {
       return asyncEndpointSync(ctx, request, url);
     }
     const records = await readJsonValue(request);
-    const shapeError = putShapeError(kind, records);
-    if (shapeError !== null) return writeFailure(kind, shapeError, decision);
-    const section = compileSection(ctx, kind, records);
-    if (!section.ok) return writeFailure(kind, section.message, decision);
-    if (kind === "endpoints") {
-      writeEndpointBatch(ctx.catalog, section.compiled, staged, url.searchParams.get("replaceAll") === "true");
-    } else {
-      writeCompiled(ctx.catalog, section.compiled, staged);
-    }
-    const results = section.compiled.map((item) => ({ action: "upsert", ok: true, resourceId: item.id, resourceKind: label }));
-    return jsonResponse(withPublishTarget({ ok: true, resourceKind: label, results, source: "candidate" }, decision), 200);
+    const replaceAll = url.searchParams.get("replaceAll") === "true";
+    return ctx.commit((draft) => {
+      const decision: PublishDecision = kind === "workflows" ? "live" : decidePublish(next, draft.catalog.gamePackage);
+      const staged = decision === "staged";
+      const shapeError = putShapeError(kind, records);
+      if (shapeError !== null) return writeFailure(kind, shapeError, decision);
+      const section = compileSection(ctx, draft.catalog, kind, records);
+      if (!section.ok) return writeFailure(kind, section.message, decision);
+      if (kind === "endpoints") {
+        writeEndpointBatch(draft.catalog, section.compiled, staged, replaceAll);
+      } else {
+        writeCompiled(draft.catalog, section.compiled, staged);
+      }
+      const results = section.compiled.map((item) => ({ action: "upsert", ok: true, resourceId: item.id, resourceKind: label }));
+      return jsonResponse(withPublishTarget({ ok: true, resourceKind: label, results, source: "candidate" }, decision), 200);
+    });
   }
   if (rest.length === 1 && method === "PATCH") {
     const value = await readJsonValue(request);
-    // A single resource may arrive bare or nested under its kind name.
-    const incoming = isRecord(value) && isRecord(value[label]) && value["id"] === undefined ? value[label] : value;
-    if (!isRecord(incoming)) return writeFailure(kind, `Body must contain a ${label} object.`, decision);
-    const first = compileSection(ctx, kind, [incoming]);
-    const [only] = first.compiled;
-    if (only === undefined || !first.ok) return writeFailure(kind, first.message, decision);
-    // A staged patch merges over the staged copy when one exists, otherwise over the stored record. The existing
-    // document is the one the patch applies to, so it decides between created, updated and unchanged.
-    const stagedRecord = staged ? stagedRecordOf(ctx.catalog, kind, only.id) : undefined;
-    const existing =
-      stagedRecord === undefined
-        ? documentOf(ctx.catalog, kind, only.id)
-        : storedFor(kind, stagedRecord, ctx.options.parseYaml);
-    const merged = patchedRecord(stagedRecord ?? storedRecordOf(ctx.catalog, kind, only.id), incoming);
-    const section = compileSection(ctx, kind, [merged]);
-    const [item] = section.compiled;
-    if (item === undefined || !section.ok) return writeFailure(kind, section.message, decision);
-    const action =
-      existing === undefined
-        ? "created"
-        : JSON.stringify(existing) === JSON.stringify(item.entry.stored)
-          ? "unchanged"
-          : "updated";
-    if (action !== "unchanged") writeCompiled(ctx.catalog, [item], staged);
-    // An unchanged patch is answered as skipped, as the reference does.
-    const skipped = action === "unchanged" ? { skipped: true } : {};
-    return jsonResponse(
-      withPublishTarget({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action, ...skipped }, decision),
-      200,
-    );
+    return ctx.commit((draft) => {
+      const decision: PublishDecision = kind === "workflows" ? "live" : decidePublish(next, draft.catalog.gamePackage);
+      const staged = decision === "staged";
+      // A single resource may arrive bare or nested under its kind name.
+      const incoming = isRecord(value) && isRecord(value[label]) && value["id"] === undefined ? value[label] : value;
+      if (!isRecord(incoming)) return writeFailure(kind, `Body must contain a ${label} object.`, decision);
+      const first = compileSection(ctx, draft.catalog, kind, [incoming]);
+      const [only] = first.compiled;
+      if (only === undefined || !first.ok) return writeFailure(kind, first.message, decision);
+      // A staged patch merges over the staged copy when one exists, otherwise over the stored record. The existing
+      // document is the one the patch applies to, so it decides between created, updated and unchanged.
+      const stagedRecord = staged ? stagedRecordOf(draft.catalog, kind, only.id) : undefined;
+      const existing =
+        stagedRecord === undefined
+          ? documentOf(draft.catalog, kind, only.id)
+          : storedFor(kind, stagedRecord, ctx.options.parseYaml);
+      const merged = patchedRecord(stagedRecord ?? storedRecordOf(draft.catalog, kind, only.id), incoming);
+      const section = compileSection(ctx, draft.catalog, kind, [merged]);
+      const [item] = section.compiled;
+      if (item === undefined || !section.ok) return writeFailure(kind, section.message, decision);
+      const action =
+        existing === undefined
+          ? "created"
+          : JSON.stringify(existing) === JSON.stringify(item.entry.stored)
+            ? "unchanged"
+            : "updated";
+      if (action !== "unchanged") writeCompiled(draft.catalog, [item], staged);
+      // An unchanged patch is answered as skipped, as the reference does.
+      const skipped = action === "unchanged" ? { skipped: true } : {};
+      return jsonResponse(
+        withPublishTarget({ ok: true, source: "candidate", resourceKind: label, resourceId: item.id, id: item.id, action, ...skipped }, decision),
+        200,
+      );
+    });
   }
   const id = rest[1];
   if (rest.length === 2 && id !== undefined && method === "DELETE") {
     const key = pathSegment(id);
     // Idempotent, as in the reference: deleting an absent resource still answers 200.
-    deleteResource(ctx.catalog, kind, key);
-    return jsonResponse({ ok: true, source: "candidate", resourceKind: label, action: "delete", resourceId: key }, 200);
+    return ctx.commit((draft) => {
+      deleteResource(draft.catalog, kind, key);
+      return jsonResponse({ ok: true, source: "candidate", resourceKind: label, action: "delete", resourceId: key }, 200);
+    });
   }
   throw noRoute();
 }
@@ -510,14 +527,18 @@ async function queriesRoute(ctx: ServerContext, request: Request, rest: readonly
   }
   if (rest.length === 1 && method === "POST") {
     const queries = parseQueries(await readJsonValue(request));
-    for (const stored of queries) ctx.catalog.queries.set(stored.definition.id, stored);
-    return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "upsert" }, 200);
+    return ctx.commit((draft) => {
+      for (const stored of queries) draft.catalog.queries.set(stored.definition.id, stored);
+      return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "upsert" }, 200);
+    });
   }
   const id = rest[1];
   if (rest.length === 2 && id !== undefined && method === "DELETE") {
     const key = pathSegment(id);
-    ctx.catalog.queries.delete(key);
-    return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "delete", resourceId: key }, 200);
+    return ctx.commit((draft) => {
+      draft.catalog.queries.delete(key);
+      return jsonResponse({ ok: true, source: "candidate", resourceKind: "query", action: "delete", resourceId: key }, 200);
+    });
   }
   throw noRoute();
 }
@@ -532,17 +553,22 @@ async function putRateLimits(ctx: ServerContext, request: Request): Promise<Resp
       400,
     );
   }
-  ctx.catalog.rateLimitRules = rules;
-  return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "upsert" }, 200);
+  return ctx.commit((draft) => {
+    draft.catalog.rateLimitRules = rules;
+    return jsonResponse({ ok: true, source: "candidate", resourceKind: "rate-limit-rules", action: "upsert" }, 200);
+  });
 }
 
 // PUT /v3/manage/{project}/settings, as the reference's PutSettingsAsync. The stored fields replace the settings the
 // protocol reads from the next request on; the signed config follows at its next build.
 async function putSettings(ctx: ServerContext, request: Request): Promise<Response> {
-  const outcome = applySettingsText(ctx.settings(), await readBodyText(request), ctx.options.requestKeys);
-  if (!outcome.ok) return jsonResponse(outcome.body, 400);
-  ctx.replaceSettings(outcome.settings);
-  return jsonResponse(settingsResponse(ctx), 200);
+  const text = await readBodyText(request);
+  return ctx.commit((draft) => {
+    const outcome = applySettingsText(draft.settings, text, ctx.options.requestKeys);
+    if (!outcome.ok) return jsonResponse(outcome.body, 400);
+    draft.settings = outcome.settings;
+    return jsonResponse(settingsResponse(ctx, outcome.settings), 200);
+  });
 }
 
 async function putTests(ctx: ServerContext, request: Request): Promise<Response> {
@@ -556,8 +582,10 @@ async function putTests(ctx: ServerContext, request: Request): Promise<Response>
     }
     tests.push(item);
   }
-  ctx.catalog.tests = tests;
-  return jsonResponse({ ok: true, source: "candidate", resourceKind: "tests", action: "replace", total: tests.length }, 200);
+  return ctx.commit((draft) => {
+    draft.catalog.tests = tests;
+    return jsonResponse({ ok: true, source: "candidate", resourceKind: "tests", action: "replace", total: tests.length }, 200);
+  });
 }
 
 // The reference runs each endpoint in process as a synthetic player and reports what happened. The auto-test
@@ -702,35 +730,37 @@ function unixSeconds(value: unknown): number | null {
 // promotes the staged revision; a first sync has no earlier revision to replace.
 async function packageSync(ctx: ServerContext, request: Request): Promise<Response> {
   const body = await readJsonBody(request);
-  const previousId = ctx.catalog.gamePackage?.["currentRevisionId"];
-  const previousRevisionId = typeof previousId === "number" ? previousId : null;
   const now = new Date(ctx.now()).toISOString();
-  const gamePackage: Record<string, unknown> = {
-    ...ctx.catalog.gamePackage,
-    ...body,
-    lastSyncedAt: now,
-    publishStatus: "published",
-  };
-  delete gamePackage["revisionFirstSyncedAtUnix"];
-  delete gamePackage["lastSyncedAtUnix"];
-  const currentId = gamePackage["currentRevisionId"];
-  const currentRevisionId = typeof currentId === "number" ? currentId : null;
-  const revisionChanged = previousRevisionId !== null && currentRevisionId !== null && previousRevisionId !== currentRevisionId;
-  if (revisionChanged || !("revisionPublishedAt" in gamePackage)) gamePackage["revisionPublishedAt"] = now;
-  ctx.catalog.gamePackage = gamePackage;
-  const promotedRevisionOverrides = revisionChanged
-    ? promoteStaged(ctx.catalog, ctx.options.parseYaml)
-    : { endpointCount: 0, collectionCount: 0, promoted: false };
-  return jsonResponse(
-    {
-      ok: true,
-      gamePackage: withUnixTimestamps(gamePackage),
-      previousRevisionId,
-      revisionChanged,
-      promotedRevisionOverrides,
-    },
-    200,
-  );
+  return ctx.commit((draft) => {
+    const previousId = draft.catalog.gamePackage?.["currentRevisionId"];
+    const previousRevisionId = typeof previousId === "number" ? previousId : null;
+    const gamePackage: Record<string, unknown> = {
+      ...draft.catalog.gamePackage,
+      ...body,
+      lastSyncedAt: now,
+      publishStatus: "published",
+    };
+    delete gamePackage["revisionFirstSyncedAtUnix"];
+    delete gamePackage["lastSyncedAtUnix"];
+    const currentId = gamePackage["currentRevisionId"];
+    const currentRevisionId = typeof currentId === "number" ? currentId : null;
+    const revisionChanged = previousRevisionId !== null && currentRevisionId !== null && previousRevisionId !== currentRevisionId;
+    if (revisionChanged || !("revisionPublishedAt" in gamePackage)) gamePackage["revisionPublishedAt"] = now;
+    draft.catalog.gamePackage = gamePackage;
+    const promotedRevisionOverrides = revisionChanged
+      ? promoteStaged(draft.catalog, ctx.options.parseYaml)
+      : { endpointCount: 0, collectionCount: 0, promoted: false };
+    return jsonResponse(
+      {
+        ok: true,
+        gamePackage: withUnixTimestamps(gamePackage),
+        previousRevisionId,
+        revisionChanged,
+        promotedRevisionOverrides,
+      },
+      200,
+    );
+  });
 }
 
 // The reference reads revision numbers as 64-bit integers; anything else is absent.

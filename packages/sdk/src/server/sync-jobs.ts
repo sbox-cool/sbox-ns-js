@@ -1,6 +1,6 @@
 import { compileBatch, documentOf, removeEndpoints, scriptGraphFault, writeCompiled, type Catalog, type Compiled, type RecordResult } from "./catalog.js";
 import type { ServerContext } from "./context.js";
-import type { PublishDecision } from "./publish-target.js";
+import { decidePublish } from "./publish-target.js";
 
 // Async sync jobs behind PUT endpoints?async=true and GET sync-jobs/:jobId. Jobs live in this process. A job that is
 // not processing expires five minutes after it was created; an expired job reads as expired once, then is forgotten.
@@ -148,13 +148,13 @@ export function writeEndpointBatch(catalog: Catalog, items: readonly Compiled[],
 export function startEndpointSync(
   ctx: ServerContext,
   text: string,
-  decision: PublishDecision,
+  next: boolean,
   replaceAll: boolean,
 ): string {
   const jobId = ctx.syncJobs.create("endpoints");
   ctx.syncJobs.stage(jobId, "validating", "complete", "Payload validated, starting background processing");
   queueMicrotask(() => {
-    void runEndpointSync(ctx, jobId, text, decision, replaceAll);
+    void runEndpointSync(ctx, jobId, text, next, replaceAll);
   });
   return jobId;
 }
@@ -206,7 +206,7 @@ async function runEndpointSync(
   ctx: ServerContext,
   jobId: string,
   text: string,
-  decision: PublishDecision,
+  next: boolean,
   replaceAll: boolean,
 ): Promise<void> {
   let stage = "compiling";
@@ -248,9 +248,22 @@ async function runEndpointSync(
     ctx.syncJobs.stage(jobId, "compiling", "complete", "All endpoints validated");
     ctx.syncJobs.stage(jobId, "saving", "processing", "Saving endpoints to storage...");
 
-    // Counts come from the catalog before the save: an item that already existed is an update.
-    const existed = new Set(batch.compiled.filter((item) => documentOf(ctx.catalog, "endpoints", item.id) !== undefined).map((item) => item.id));
-    writeEndpointBatch(ctx.catalog, batch.compiled, decision === "staged", replaceAll);
+    // The graph is checked again and the publish target decided inside the commit, against the catalog the write lands
+    // on. Counts come from that catalog before the write, so an item that already existed is an update.
+    const outcome = await ctx.commit((draft) => {
+      const recheck = scriptGraphFault(draft.catalog, batch.compiled);
+      if (recheck !== null) return { graph: recheck, existed: new Set<string>() };
+      const existed = new Set(
+        batch.compiled.filter((item) => documentOf(draft.catalog, "endpoints", item.id) !== undefined).map((item) => item.id),
+      );
+      writeEndpointBatch(draft.catalog, batch.compiled, decidePublish(next, draft.catalog.gamePackage) === "staged", replaceAll);
+      return { graph: null, existed };
+    });
+    if (outcome.graph !== null) {
+      failJob(ctx, jobId, stage, outcome.graph.code, "One or more endpoints failed validation.", [failedRow("", outcome.graph.message)]);
+      return;
+    }
+    const existed = outcome.existed;
 
     let createdCount = 0;
     let updatedCount = 0;

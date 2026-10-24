@@ -41,3 +41,10 @@ export {
   type KvCoordinatorNamespace,
   type KvStorageOptions,
 } from "./kv.js";
+export {
+  ControlStateConflict,
+  createPostgresControlStateStore,
+  createSqliteControlStateStore,
+  type ControlStateRow,
+  type ControlStateStore,
+} from "./control.js";
