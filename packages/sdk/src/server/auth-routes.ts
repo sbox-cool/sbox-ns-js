@@ -1,11 +1,12 @@
 import { ProtocolError } from "../protocol/errors.js";
-import { claimedSteamId, readSessionToken, resolvePlayer } from "../protocol/identity.js";
+import { isPlausibleSteamId, readSessionToken, requestedClaimsMatch, requestedSteamId, verifySboxPlayer } from "../protocol/identity.js";
 import {
   createAuthSession,
   DEFAULT_SESSION_TTL_SECONDS,
   normalizeSessionTtl,
   REVOCATION_RETENTION_MS,
   refreshAuthSession,
+  requireActiveAuthSession,
   verifyAuthSession,
   type IssuedSession,
 } from "../protocol/sessions.js";
@@ -47,6 +48,12 @@ function sessionFailure(code: string, detail: string | null, requestId: string):
   return jsonResponse(body, 200, { "x-request-id": requestId });
 }
 
+// A session refusal thrown from inside the flow. The table supplies the message unless `detail` is given.
+function refuse(code: string, detail?: string): ProtocolError {
+  const known = Object.hasOwn(SESSION_ERRORS, code) ? SESSION_ERRORS[code] : undefined;
+  return new ProtocolError(known?.status ?? 500, code, detail ?? known?.message ?? "Unknown error.");
+}
+
 function issuedBody(issued: IssuedSession): Record<string, unknown> {
   return {
     ok: true,
@@ -86,14 +93,20 @@ export async function handleAuthSession(
     const nowMs = ctx.now();
     const credentials = credentialsOf(request, url, body);
     const ttlSeconds = normalizeSessionTtl(ctx.settings().security.authSessionTtlSeconds ?? DEFAULT_SESSION_TTL_SECONDS);
-    const identityOptions = identityOptionsFor(ctx, "", nowMs);
+    const identityOptions = identityOptionsFor(ctx, `__auth_session_${op}`, nowMs);
 
     if (op === "create") {
-      const identity = await resolvePlayer(credentials, claimedSteamId(credentials), identityOptions);
+      // Create always proves the player with s&box and ignores any presented session, whatever `requireSboxAuth` says.
+      const claimed = requestedSteamId(credentials);
+      if (claimed === null || !isPlausibleSteamId(claimed)) {
+        throw refuse("INVALID_STEAMID", "Create session requires a plausible x-steam-id value.");
+      }
+      const verified = await verifySboxPlayer(credentials, identityOptions);
+      if (!requestedClaimsMatch(credentials, verified)) throw refuse("AUTH_SESSION_STEAMID_MISMATCH");
       const issued = await createAuthSession(secret, {
         userId: options.ownerUserId,
         projectId: options.projectId,
-        steamId: identity.steamId,
+        steamId: verified,
         ttlSeconds,
         nowMs,
       });
@@ -108,20 +121,16 @@ export async function handleAuthSession(
     }
 
     if (op === "reauth") {
-      // Reauth proves identity again. A presented session is refreshed within its own family, so a revoke still reaches
-      // every token the caller holds; a fresh family is minted only when no session was presented.
-      const identity = await resolvePlayer(credentials, claimedSteamId(credentials), identityOptions);
-      const presented = readSessionToken(credentials);
-      const issued =
-        presented !== null
-          ? await refreshAuthSession(secret, presented, options.projectId, ttlSeconds, nowMs, ctx.revocations)
-          : await createAuthSession(secret, {
-              userId: options.ownerUserId,
-              projectId: options.projectId,
-              steamId: identity.steamId,
-              ttlSeconds,
-              nowMs,
-            });
+      // Reauth needs a live presented session and a fresh s&box proof for the same player. Only then does it refresh
+      // within that session's family, so a revoked or unverified caller never mints a successor.
+      const token = readSessionToken(credentials);
+      if (token === null) throw refuse("AUTH_SESSION_REQUIRED");
+      const current = await requireActiveAuthSession(secret, token, options.projectId, nowMs, ctx.revocations);
+      const verified = await verifySboxPlayer(credentials, identityOptions);
+      if (verified !== current.steamId || !requestedClaimsMatch(credentials, verified)) {
+        throw refuse("AUTH_SESSION_STEAMID_MISMATCH");
+      }
+      const issued = await refreshAuthSession(secret, token, options.projectId, ttlSeconds, nowMs, ctx.revocations);
       return jsonResponse(issuedBody(issued), 200);
     }
 
