@@ -10,6 +10,12 @@ export const DEFAULT_SESSION_TTL_SECONDS = 60 * 60;
 export const MIN_SESSION_TTL_SECONDS = 60;
 export const MAX_SESSION_TTL_SECONDS = 24 * 60 * 60;
 
+/**
+ * How long a family revocation marker is kept. A token minted before the revoke expires within the max TTL of the
+ * revoke; the extra hour tolerates clock skew, matching the reference RevocationGraceSeconds.
+ */
+export const REVOCATION_RETENTION_MS = (MAX_SESSION_TTL_SECONDS + 60 * 60) * 1000;
+
 export function normalizeSessionTtl(value: number): number {
   return Math.min(MAX_SESSION_TTL_SECONDS, Math.max(MIN_SESSION_TTL_SECONDS, Math.trunc(value)));
 }
@@ -65,10 +71,18 @@ async function encode(secret: SessionSecret, claims: AuthSessionClaims): Promise
   return `${SESSION_TOKEN_PREFIX}${payload}.${await sign(secret, payload)}`;
 }
 
-/** Issues a session token. The token is stateless: the signature covers the base64url payload string. */
+/** Revocation lookups keyed by session family id. Structural, so the protocol layer does not import the server layer. */
+export interface SessionRevocationCheck {
+  isRevoked(familyId: string): Promise<boolean>;
+}
+
+/** Issues a session token in a new family. The token is stateless: the signature covers the base64url payload string. */
 export async function createAuthSession(secret: SessionSecret, input: CreateSessionInput): Promise<IssuedSession> {
+  return mintAuthSession(secret, input, hexEncode(await randomBytes(16)));
+}
+
+async function mintAuthSession(secret: SessionSecret, input: CreateSessionInput, id: string): Promise<IssuedSession> {
   const ttlSeconds = normalizeSessionTtl(input.ttlSeconds);
-  const id = hexEncode(await randomBytes(16));
   const session: AuthSessionClaims = {
     id,
     userId: input.userId,
@@ -81,17 +95,50 @@ export async function createAuthSession(secret: SessionSecret, input: CreateSess
   return { token: await encode(secret, session), ttlSeconds, session };
 }
 
-/** Refresh re-issues a valid session for the same player, recording the session it replaced. */
-export async function refreshAuthSession(secret: SessionSecret, token: string, projectId: string, ttlSeconds: number, nowMs: number): Promise<IssuedSession> {
-  const current = await verifyAuthSession(secret, token, projectId, nowMs);
-  return createAuthSession(secret, {
-    userId: current.userId,
-    projectId: current.projectId,
-    steamId: current.steamId,
-    ttlSeconds,
-    metadata: { refreshedFrom: current.id },
-    nowMs,
-  });
+/** Verifies a presented token and rejects it when its session family is revoked. Every path that accepts a token uses this. */
+export async function requireActiveAuthSession(
+  secret: SessionSecret,
+  token: string,
+  projectId: string,
+  nowMs: number,
+  revocations: SessionRevocationCheck,
+): Promise<AuthSessionClaims> {
+  const claims = await verifyAuthSession(secret, token, projectId, nowMs);
+  if (await revocations.isRevoked(claims.id)) {
+    throw refuse("AUTH_SESSION_REVOKED", "Auth session has been revoked. Create a new session.");
+  }
+  return claims;
+}
+
+/**
+ * Refresh mints a successor in the same family (the payload id is kept), so revoking any token of the family
+ * revokes every token of it. The revocation check runs again after minting, so a revoke that lands mid-refresh wins.
+ */
+export async function refreshAuthSession(
+  secret: SessionSecret,
+  token: string,
+  projectId: string,
+  ttlSeconds: number,
+  nowMs: number,
+  revocations: SessionRevocationCheck,
+): Promise<IssuedSession> {
+  const current = await requireActiveAuthSession(secret, token, projectId, nowMs, revocations);
+  const issued = await mintAuthSession(
+    secret,
+    {
+      userId: current.userId,
+      projectId: current.projectId,
+      steamId: current.steamId,
+      ttlSeconds,
+      metadata: { refreshedFrom: current.id },
+      nowMs,
+    },
+    current.id,
+  );
+  if (await revocations.isRevoked(current.id)) {
+    throw refuse("AUTH_SESSION_REVOKED", "Auth session has been revoked. Create a new session.");
+  }
+  return issued;
 }
 
 function readLong(record: Record<string, unknown>, key: string): number {

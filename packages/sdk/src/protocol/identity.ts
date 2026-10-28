@@ -2,7 +2,12 @@ import { constantTimeEqual, hexEncode, utf8 } from "../util/bytes.js";
 import { hmacSha256 } from "./crypto.js";
 import { ProtocolError } from "./errors.js";
 import { readField, refuseEnvelope } from "./fields.js";
-import { type AuthSessionClaims, type SessionSecret, verifyAuthSession } from "./sessions.js";
+import {
+  requireActiveAuthSession,
+  type AuthSessionClaims,
+  type SessionRevocationCheck,
+  type SessionSecret,
+} from "./sessions.js";
 
 /** Payload keys that carry identity or auth and never reach endpoint code. Mirrors the server's reserved set. */
 export const RESERVED_PAYLOAD_KEYS: Record<string, true> = {
@@ -42,7 +47,7 @@ export interface IdentityOptions {
   ownerUserId: number;
   /** Mirrors the project's `RequireSboxAuth`. When false, unverified legacy callers pass through. */
   requireSboxAuth: boolean;
-  sessions: { secret: SessionSecret } | null;
+  sessions: { secret: SessionSecret; revocations: SessionRevocationCheck } | null;
   nowMs: number;
   fetch: FetchLike;
 }
@@ -174,7 +179,13 @@ export async function resolvePlayer(
     if (options.sessions === null) {
       throw new ProtocolError(403, "AUTH_SESSION_DISABLED", "Auth sessions are not enabled for this project.");
     }
-    const claims = await verifyAuthSession(options.sessions.secret, sessionToken, options.projectId, options.nowMs);
+    const claims = await requireActiveAuthSession(
+      options.sessions.secret,
+      sessionToken,
+      options.projectId,
+      options.nowMs,
+      options.sessions.revocations,
+    );
     assertSessionOwner(claims, options.ownerUserId);
     verifiedSteamId = claims.steamId;
     sessionId = claims.id;

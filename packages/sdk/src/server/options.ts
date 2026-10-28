@@ -7,8 +7,11 @@ import type { ReplayStore } from "../protocol/replay.js";
 import type { CollectionDefinition, EndpointStorage } from "../storage/types.js";
 import type { ControlStateOptions } from "./control-state.js";
 
-// Records logouts. Auth session tokens are stateless and expire on their own; revocation needs a shared
-// store to be enforced across processes. The SDK ships an in-process store and never claims cross-instance
+// Records logouts at the session family level. `sessionId` is the family id: the payload `id` shared by a session and
+// every token refreshed or reauthenticated from it, so one revoke invalidates the whole family. A revoke must be
+// retained at least until every token it could invalidate has expired (the max TTL plus clock-skew grace); the SDK
+// passes `now + REVOCATION_RETENTION_MS`. Auth session tokens are stateless and expire on their own; revocation needs
+// a shared store to be enforced across processes. The SDK ships an in-process store and never claims cross-instance
 // revocation unless the caller supplies a shared one.
 export interface SessionRevocations {
   revoke(sessionId: string, expiresAtMs: number): Promise<void>;

@@ -4,6 +4,7 @@ import {
   createAuthSession,
   DEFAULT_SESSION_TTL_SECONDS,
   normalizeSessionTtl,
+  REVOCATION_RETENTION_MS,
   refreshAuthSession,
   verifyAuthSession,
   type IssuedSession,
@@ -24,6 +25,7 @@ const SESSION_ERRORS: Record<string, { status: number; message: string; docsUrl:
   AUTH_SESSION_REQUIRED: { status: 401, message: "Auth session token is required.", docsUrl: `${WIKI}/sbox-auth#session-caching` },
   AUTH_SESSION_INVALID: { status: 401, message: "Auth session token is invalid.", docsUrl: `${WIKI}/sbox-auth#session-caching` },
   AUTH_SESSION_EXPIRED: { status: 401, message: "Auth session has expired.", docsUrl: `${WIKI}/sbox-auth#session-caching` },
+  AUTH_SESSION_REVOKED: { status: 401, message: "Auth session has been revoked. Create a new session.", docsUrl: `${WIKI}/sbox-auth#session-caching` },
   AUTH_SESSION_STEAMID_MISMATCH: { status: 403, message: "Auth session does not match the supplied Steam ID.", docsUrl: `${WIKI}/sbox-auth#session-caching` },
   INVALID_STEAMID: { status: 400, message: "Steam ID must be a plausible numeric s&box/Steam ID.", docsUrl: `${WIKI}/sbox-auth#implementing-auth-in-your-game` },
   PROJECT_DISABLED: { status: 403, message: "This project is currently disabled.", docsUrl: `${WIKI}/quick-start#2-create-a-project` },
@@ -101,36 +103,33 @@ export async function handleAuthSession(
     if (op === "refresh") {
       const token = readSessionToken(credentials);
       if (token === null) throw new ProtocolError(401, "AUTH_SESSION_REQUIRED", "Auth session token is required.");
-      const current = await verifyAuthSession(secret, token, options.projectId, nowMs);
-      if (await ctx.revocations.isRevoked(current.id)) {
-        throw new ProtocolError(401, "AUTH_SESSION_REVOKED", "The auth session was revoked.");
-      }
-      const issued = await refreshAuthSession(secret, token, options.projectId, ttlSeconds, nowMs);
+      const issued = await refreshAuthSession(secret, token, options.projectId, ttlSeconds, nowMs, ctx.revocations);
       return jsonResponse(issuedBody(issued), 200);
     }
 
     if (op === "reauth") {
-      // Reauth proves identity again, then replaces any session the caller presented.
+      // Reauth proves identity again. A presented session is refreshed within its own family, so a revoke still reaches
+      // every token the caller holds; a fresh family is minted only when no session was presented.
       const identity = await resolvePlayer(credentials, claimedSteamId(credentials), identityOptions);
       const presented = readSessionToken(credentials);
-      if (presented !== null) {
-        const old = await verifyAuthSession(secret, presented, options.projectId, nowMs);
-        await ctx.revocations.revoke(old.id, old.expiresAt);
-      }
-      const issued = await createAuthSession(secret, {
-        userId: options.ownerUserId,
-        projectId: options.projectId,
-        steamId: identity.steamId,
-        ttlSeconds,
-        nowMs,
-      });
+      const issued =
+        presented !== null
+          ? await refreshAuthSession(secret, presented, options.projectId, ttlSeconds, nowMs, ctx.revocations)
+          : await createAuthSession(secret, {
+              userId: options.ownerUserId,
+              projectId: options.projectId,
+              steamId: identity.steamId,
+              ttlSeconds,
+              nowMs,
+            });
       return jsonResponse(issuedBody(issued), 200);
     }
 
     const token = readSessionToken(credentials);
     if (token === null) throw new ProtocolError(401, "AUTH_SESSION_REQUIRED", "Auth session token is required.");
     const claims = await verifyAuthSession(secret, token, options.projectId, nowMs);
-    await ctx.revocations.revoke(claims.id, claims.expiresAt);
+    // Revoke is idempotent and retains the marker past the longest token the family could still hold.
+    await ctx.revocations.revoke(claims.id, nowMs + REVOCATION_RETENTION_MS);
     return jsonResponse({ ok: true, revoked: true, sessionId: claims.id }, 200);
   } catch (error) {
     const description = describeError(error);
