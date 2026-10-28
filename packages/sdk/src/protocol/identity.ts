@@ -156,15 +156,8 @@ export async function resolvePlayer(
   options: IdentityOptions,
 ): Promise<PlayerIdentity> {
   const sessionToken = readSessionToken(req);
-  const token = firstPresent(
-    req.header("x-sbox-token"),
-    req.header("x-sbox-auth-token"),
-    req.query("token"),
-    bodyString(req, "token"),
-  );
-  const clientSteamId = firstPresent(req.header("x-on-behalf-of"));
-  const clientToken = firstPresent(req.header("x-on-behalf-of-token"));
-  const proxySignature = firstPresent(req.header("x-proxy-signature"));
+  const creds = readSboxCredentials(req);
+  const { token, clientSteamId, clientToken, proxySignature } = creds;
   const hasSboxCredentials = [token, clientSteamId, clientToken, proxySignature].some((value) => value !== null);
 
   // Projects that do not require s&box auth let legacy callers through with their claimed identity. Presented
@@ -192,14 +185,7 @@ export async function resolvePlayer(
   }
 
   if (hasSboxCredentials || sessionToken === null) {
-    const checked = await checkSboxIdentity(
-      { hostToken: token ?? "", hostSteamId: claimed ?? "", clientSteamId, clientToken, proxySignature },
-      options,
-    );
-    // A proxied request is verified against the client's own token as well.
-    const resolved = clientSteamId !== null
-      ? await checkSboxIdentity({ hostToken: clientToken ?? "", hostSteamId: clientSteamId, clientSteamId: null, clientToken: null, proxySignature: null }, options)
-      : checked;
+    const resolved = await verifySboxCredentials(creds, claimed, options);
     if (verifiedSteamId !== null && verifiedSteamId !== resolved) {
       throw new ProtocolError(
         403,
@@ -244,6 +230,89 @@ export function claimedSteamId(req: RequestCredentials): string | null {
     req.query("steamid"),
     bodyString(req, "steamId"),
   );
+}
+
+/** The s&box token and proxy fields a request carries. Mirrors the server's ReadHostToken and proxy headers. */
+interface SboxCredentials {
+  token: string | null;
+  clientSteamId: string | null;
+  clientToken: string | null;
+  proxySignature: string | null;
+}
+
+function readSboxCredentials(req: RequestCredentials): SboxCredentials {
+  return {
+    token: firstPresent(req.header("x-sbox-token"), req.header("x-sbox-auth-token"), req.query("token"), bodyString(req, "token")),
+    clientSteamId: firstPresent(req.header("x-on-behalf-of")),
+    clientToken: firstPresent(req.header("x-on-behalf-of-token")),
+    proxySignature: firstPresent(req.header("x-proxy-signature")),
+  };
+}
+
+/**
+ * Verifies the player behind s&box credentials. A proxied request is also checked against the client's own token,
+ * and that result is the verified identity.
+ */
+async function verifySboxCredentials(
+  creds: SboxCredentials,
+  claimed: string | null,
+  options: IdentityOptions,
+): Promise<string> {
+  const { token, clientSteamId, clientToken, proxySignature } = creds;
+  const checked = await checkSboxIdentity(
+    { hostToken: token ?? "", hostSteamId: claimed ?? "", clientSteamId, clientToken, proxySignature },
+    options,
+  );
+  return clientSteamId !== null
+    ? await checkSboxIdentity(
+      { hostToken: clientToken ?? "", hostSteamId: clientSteamId, clientSteamId: null, clientToken: null, proxySignature: null },
+      options,
+    )
+    : checked;
+}
+
+/**
+ * Verifies the s&box player for a session route. Unlike resolvePlayer this always checks Facepunch, whatever
+ * `requireSboxAuth` says, and never accepts a presented session token. Throws `SBOX_AUTH_FAILED` on refusal.
+ */
+export function verifySboxPlayer(req: RequestCredentials, options: IdentityOptions): Promise<string> {
+  return verifySboxCredentials(readSboxCredentials(req), claimValues(req, true)[0] ?? null, options);
+}
+
+/**
+ * Non-blank, trimmed Steam ID claims in precedence order. The proxy host's x-sbox-steam-id is included only when asked.
+ * Mirrors the server's ClaimValues.
+ */
+function claimValues(req: RequestCredentials, includeHostHeader: boolean): string[] {
+  return [
+    req.header("x-steam-id"),
+    includeHostHeader ? req.header("x-sbox-steam-id") : undefined,
+    req.query("steamId"),
+    req.query("steamid"),
+    bodyString(req, "steamId"),
+  ]
+    .map((value) => value?.trim() ?? "")
+    .filter((value) => value !== "");
+}
+
+/** The Steam ID the caller names as the requested player. The proxy host's header is not a player claim. */
+export function requestedSteamId(req: RequestCredentials): string | null {
+  return claimValues(req, false)[0] ?? null;
+}
+
+/** A plausible numeric Steam ID. Mirrors the server's IsPlausibleSteamId. */
+export function isPlausibleSteamId(value: string): boolean {
+  return /^[79][0-9]{3,16}$/.test(value);
+}
+
+/**
+ * True when every Steam ID the caller names equals the verified steam id, or the proxy host's steam id when the request
+ * is delegated. Mirrors the server's RequestedClaimsMatch.
+ */
+export function requestedClaimsMatch(req: RequestCredentials, verifiedSteamId: string): boolean {
+  const delegated = firstPresent(req.header("x-on-behalf-of")) !== null;
+  const hostSteamId = delegated ? claimValues(req, true)[0] : undefined;
+  return claimValues(req, false).every((claim) => claim === verifiedSteamId || claim === hostSteamId);
 }
 
 interface SboxCheck {
