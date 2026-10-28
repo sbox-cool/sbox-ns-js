@@ -7,8 +7,9 @@ const CLEANUP_INTERVAL_MS = 10_000;
 const REQUEST_ID_PATTERN = /^([0-9]{9,11})_([A-Za-z0-9_-]{6,})$/;
 
 /**
- * Claimed encrypted-request ids. `claim` MUST be atomic: a key that is already claimed and unexpired is refused.
- * Multi-instance deployments need a store shared between instances, such as a database unique key.
+ * Claimed encrypted-request ids. `claim` MUST be atomic: a key that is already claimed and live is refused. A claim is
+ * live while `nowMs < expiresAtMs`; a store MUST refuse the key for that whole span and MAY forget it only once
+ * `expiresAtMs <= nowMs`. Multi-instance deployments need a store shared between instances, such as a database unique key.
  */
 export interface ReplayStore {
   claim(key: string, expiresAtMs: number, nowMs: number): Promise<boolean>;
@@ -52,8 +53,9 @@ export async function consumeRequestId(store: ReplayStore, check: ReplayCheck): 
       `encryptedRequestId is outside the accepted ${check.windowSeconds} second replay window.`,
     );
   }
-  // Expiry follows the id's issue time, not the arrival time, so a claim lives exactly as long as it can be replayed.
-  const expiresAtMs = (issuedSeconds + check.windowSeconds) * 1000;
+  // The id is accepted while floor(now seconds) is within `windowSeconds` of its issue second, inclusive, so the last
+  // accepted instant is the millisecond before `(issued + window + 1) * 1000`. The claim must stay live through it.
+  const expiresAtMs = (issuedSeconds + check.windowSeconds + 1) * 1000;
   const claimed = await store.claim(`${check.projectId}:${check.identityKey}:${requestId}`, expiresAtMs, check.nowMs);
   if (!claimed) {
     throw new ProtocolError(

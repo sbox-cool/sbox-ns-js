@@ -9,7 +9,7 @@ import { clampReplayWindow, consumeRequestId } from "../protocol/replay.js";
 import { claimedSteamId, readSessionToken, resolvePlayer } from "../protocol/identity.js";
 import { isLibraryCaller, libraryErrorBody } from "../protocol/library.js";
 import { envelopeKindOf, securityDenial, type EnvelopeKind } from "../protocol/security.js";
-import { verifyAuthSession } from "../protocol/sessions.js";
+import { requireActiveAuthSession } from "../protocol/sessions.js";
 import { isRecord } from "../util/guards.js";
 import { jsonResponse, traceIdentifier } from "../util/http.js";
 import { identityOptionsFor, type RuntimeView, type ServerContext } from "./context.js";
@@ -176,7 +176,7 @@ async function runCall(
   const presentedToken = readSessionToken(headerCredentials);
   const sessionId =
     presentedToken !== null && options.sessionSecret !== null && ctx.settings().security.enableAuthSessions
-      ? (await verifyAuthSession(options.sessionSecret, presentedToken, options.projectId, nowMs)).id
+      ? (await requireActiveAuthSession(options.sessionSecret, presentedToken, options.projectId, nowMs, ctx.revocations)).id
       : null;
 
   let commandBody: Readonly<Record<string, unknown>> | null = body;
@@ -240,9 +240,6 @@ async function runCall(
     claimedSteamId(credentials),
     identityOptionsFor(ctx, slug, nowMs),
   );
-  if (identity.sessionId !== null && (await ctx.revocations.isRevoked(identity.sessionId))) {
-    throw new ProtocolError(401, "AUTH_SESSION_REVOKED", "The auth session was revoked.");
-  }
 
   const input =
     request.method === "GET" ? queryInput(url) : bodyInput(commandBody, pathSlug !== null);

@@ -47,16 +47,24 @@ export interface ServerContext {
   assertHealthy(): void;
 }
 
-// In-process revocation list. Entries live until their session would have expired anyway. Multi-instance
-// deployments must supply a shared store, or a logout only applies to the instance that received it.
-function createMemoryRevocations(): SessionRevocations {
+// In-process revocation list, keyed by session family id. Markers expire after REVOCATION_RETENTION_MS and are pruned
+// as new ones arrive. Multi-instance deployments must supply a shared store, or a revoke only applies to the instance
+// that received it.
+function createMemoryRevocations(now: () => number): SessionRevocations {
   const revoked = new Map<string, number>();
+  const prune = (): void => {
+    for (const [familyId, expiresAt] of revoked) {
+      if (expiresAt <= now()) revoked.delete(familyId);
+    }
+  };
   return {
     async revoke(sessionId, expiresAtMs) {
+      prune();
       revoked.set(sessionId, expiresAtMs);
     },
     async isRevoked(sessionId) {
-      return revoked.has(sessionId);
+      const expiresAt = revoked.get(sessionId);
+      return expiresAt !== undefined && expiresAt > now();
     },
   };
 }
@@ -104,7 +112,7 @@ export function createServerContext(options: ServerOptions): ServerContext {
   return {
     options,
     config: createConfigSource(options, () => managed.security),
-    revocations: options.sessionRevocations ?? createMemoryRevocations(),
+    revocations: options.sessionRevocations ?? createMemoryRevocations(now),
     catalog,
     syncJobs: createSyncJobs(now, options.projectId),
     now,
@@ -140,7 +148,7 @@ export function identityOptionsFor(
     apiKey: options.publicKey,
     ownerUserId: options.ownerUserId,
     requireSboxAuth: ctx.settings().requireSboxAuth,
-    sessions: options.sessionSecret === null ? null : { secret: options.sessionSecret },
+    sessions: options.sessionSecret === null ? null : { secret: options.sessionSecret, revocations: ctx.revocations },
     nowMs,
     fetch: globalThis.fetch,
   };
